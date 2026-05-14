@@ -24,4 +24,17 @@ public enum LiveStreamCopy {
     public static let enableForNext = "stream the next recording"
     public static let titleField = "set name"
     public static let titlePlaceholder = "untitled set"
+
+    // MARK: - Engagement
+
+    public static let listenerJoinedSuffix = "joined"
+    public static let listenerJoinedSingularPrefix = "+1"
+    public static let totalListenersLabel = "total"
+    public static let peakListenersLabel = "peak"
+    public static let reactionsLabel = "reactions"
+    public static let vibeLabel = "vibe"
+    public static let broadcastEndedTitle = "set complete"
+    public static let broadcastSummaryDismiss = "done"
+    public static let waitingForListeners = "waiting for first listener"
+    public static let firstReactionHint = "your listeners can react in real time"
 }

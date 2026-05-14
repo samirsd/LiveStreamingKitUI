@@ -14,6 +14,11 @@ public final class LiveStreamControlViewModel: ObservableObject {
     @Published public private(set) var peakListenerCount: Int = 0
     @Published public private(set) var reactionTotals: [String: Int] = [:]
     @Published public private(set) var floatingReactions: [LiveReactionEvent] = []
+    /// Flips true for one tick when the broadcaster's session transitions
+    /// from ``.live`` to any terminal state. Consumers observe this to
+    /// surface the post-broadcast summary card. Reset to false by calling
+    /// ``acknowledgeBroadcastEnd()``.
+    @Published public private(set) var justEndedBroadcast: Bool = false
     @Published public private(set) var segmentsSent: Int = 0
     @Published public private(set) var latencyMilliseconds: Int = 0
     @Published public private(set) var activeSession: LiveStreamSession?
@@ -37,6 +42,7 @@ public final class LiveStreamControlViewModel: ObservableObject {
     public func ingest(_ event: LiveStreamEvent) {
         switch event {
         case .stateChanged(let newState):
+            let previousState = state
             state = newState
             switch newState {
             case .live(let session, let since):
@@ -44,6 +50,13 @@ public final class LiveStreamControlViewModel: ObservableObject {
                 liveStartedAt = since
                 startTicker()
             case .stopped, .idle, .failed:
+                // Detect a live→terminal transition specifically — opening
+                // a fresh view that already shows the terminal state doesn't
+                // trigger the celebration. The flag stays set until the
+                // consumer calls acknowledgeBroadcastEnd().
+                if case .live = previousState {
+                    justEndedBroadcast = true
+                }
                 activeSession = nil
                 liveStartedAt = nil
                 stopTicker()
@@ -84,6 +97,13 @@ public final class LiveStreamControlViewModel: ObservableObject {
         default:
             break
         }
+    }
+
+    /// Clear the ``justEndedBroadcast`` flag. Call from the
+    /// `BroadcastSummaryCard`'s onDismiss callback (or any other consumer of
+    /// the transition signal) once the celebration moment has been shown.
+    public func acknowledgeBroadcastEnd() {
+        justEndedBroadcast = false
     }
 
     public func toggle() async {

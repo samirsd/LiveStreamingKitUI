@@ -34,6 +34,25 @@ public struct LiveStreamControlView: View {
                 .padding(.top, 8)
                 .padding(.trailing, 12)
         }
+        .overlay {
+            // The celebration card surfaces the moment a live broadcast
+            // ends with the broadcaster still on this view. Tapping
+            // "done" dismisses it (via acknowledgeBroadcastEnd) and the
+            // post-stream stats remain visible in the underlying surface.
+            if viewModel.justEndedBroadcast {
+                Color.black.opacity(0.25)
+                    .ignoresSafeArea()
+                    .transition(.opacity)
+                BroadcastSummaryCard(
+                    totalListeners: viewModel.totalListeners,
+                    peakListenerCount: viewModel.peakListenerCount,
+                    reactionTotals: viewModel.reactionTotals,
+                    onDismiss: { viewModel.acknowledgeBroadcastEnd() }
+                )
+                .transition(.scale(scale: 0.92).combined(with: .opacity))
+            }
+        }
+        .animation(.spring(response: 0.32, dampingFraction: 0.78), value: viewModel.justEndedBroadcast)
     }
 
     private var header: some View {
@@ -73,35 +92,40 @@ public struct LiveStreamControlView: View {
     }
 
     private var metricsRow: some View {
-        HStack(spacing: 16) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("\(viewModel.listenerCount)")
-                    .font(.title3.weight(.semibold).monospacedDigit())
-                Text(LiveStreamCopy.listeners)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                if viewModel.totalListeners > 0 || viewModel.peakListenerCount > 0 {
-                    // Compact lifetime stats sit under "listening now" so a
-                    // glance still answers "how big is this set right now?"
-                    // without the broadcaster losing the trend numbers.
-                    Text(lifetimeStatsCopy)
-                        .font(.caption2.monospacedDigit())
-                        .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 16) {
+                VStack(alignment: .leading, spacing: 4) {
+                    ListenerCountChip(
+                        count: viewModel.listenerCount,
+                        toastEnabled: viewModel.isLive
+                    )
+                    if viewModel.totalListeners > 0 || viewModel.peakListenerCount > 0 {
+                        Text(lifetimeStatsCopy)
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                metric(value: viewModel.latencyText, label: LiveStreamCopy.latency)
+                metric(value: "\(viewModel.segmentsSent)", label: LiveStreamCopy.segmentsSent)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            metric(value: viewModel.latencyText, label: LiveStreamCopy.latency)
-            metric(value: "\(viewModel.segmentsSent)", label: LiveStreamCopy.segmentsSent)
+            // VibeMeter sits below the metrics row because reactions arrive
+            // fast and a wide bar reads better than a narrow column.
+            // Only render while live (and during the brief post-stream tail)
+            // — pending sessions have no reactions to meter.
+            if viewModel.isLive || viewModel.justEndedBroadcast {
+                VibeMeter(reactions: viewModel.floatingReactions)
+            }
         }
     }
 
     private var lifetimeStatsCopy: String {
         var parts: [String] = []
         if viewModel.totalListeners > 0 {
-            parts.append("\(viewModel.totalListeners) total")
+            parts.append("\(viewModel.totalListeners) \(LiveStreamCopy.totalListenersLabel)")
         }
         if viewModel.peakListenerCount > 0 {
-            parts.append("peak \(viewModel.peakListenerCount)")
+            parts.append("\(LiveStreamCopy.peakListenersLabel) \(viewModel.peakListenerCount)")
         }
         return parts.joined(separator: " · ")
     }
@@ -219,6 +243,7 @@ struct FloatingReactionsOverlay: View {
 
 private struct FloatingReactionView: View {
     let reaction: LiveReactionEvent
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var hasAppeared = false
 
     // Stable random horizontal offset derived from the reaction id. Two
@@ -232,9 +257,17 @@ private struct FloatingReactionView: View {
     var body: some View {
         Text(LiveStreamReactionDisplay.emoji[reaction.type] ?? "·")
             .font(.title2)
-            .opacity(hasAppeared ? 0.2 : 1)
-            .offset(x: offsetX, y: hasAppeared ? -110 : -10)
-            .animation(.easeOut(duration: LiveStreamControlViewModel.reactionFloatDuration), value: hasAppeared)
+            .opacity(hasAppeared ? (reduceMotion ? 0 : 0.2) : 1)
+            .offset(
+                x: offsetX,
+                // Under reduce-motion, drop the y-rise — the reaction
+                // still surfaces (fade in/out) but doesn't travel.
+                y: reduceMotion ? 0 : (hasAppeared ? -110 : -10)
+            )
+            .animation(
+                .easeOut(duration: LiveStreamControlViewModel.reactionFloatDuration),
+                value: hasAppeared
+            )
             .onAppear { hasAppeared = true }
     }
 }
