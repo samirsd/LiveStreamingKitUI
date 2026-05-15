@@ -23,6 +23,27 @@ public final class LiveStreamControlViewModel: ObservableObject {
     @Published public private(set) var latencyMilliseconds: Int = 0
     @Published public private(set) var activeSession: LiveStreamSession?
     @Published public private(set) var lastErrorMessage: String?
+    /// Short label identifying the streaming backend host (e.g. "dev.carnyx.app").
+    /// When non-nil the broadcaster sheet renders a small chip near the
+    /// status badge so it's obvious at a glance which environment you'll be
+    /// streaming to. Host apps populate this from their `APIEnvironment` —
+    /// production should pass `nil` so the chip stays hidden in shipping
+    /// builds.
+    @Published public var streamingHostLabel: String?
+    /// Latest health classification reported by the engine's monitor task.
+    /// Stays `.healthy` outside of `.live` states.
+    @Published public private(set) var streamHealth: LiveStreamHealth = .healthy
+    /// Short reason string accompanying the most recent non-healthy report
+    /// (e.g. "uploads stalled 11s"). Empty when healthy.
+    @Published public private(set) var streamHealthReason: String = ""
+    /// File URL of the most recently finalized broadcast archive. Set when
+    /// the engine emits `archiveSaved` after `stop()`. Nil between
+    /// broadcasts. The post-broadcast summary card surfaces a "share
+    /// broadcast" action when this is non-nil.
+    @Published public private(set) var lastArchiveURL: URL?
+    /// Size of the saved archive in bytes — used by the summary card to
+    /// render a short "n MB" hint next to the share button.
+    @Published public private(set) var lastArchiveBytes: Int = 0
 
     /// How long each emitted reaction stays in `floatingReactions` before
     /// being auto-pruned. Matches the listener page's 1.8s float duration
@@ -48,6 +69,11 @@ public final class LiveStreamControlViewModel: ObservableObject {
             case .live(let session, let since):
                 activeSession = session
                 liveStartedAt = since
+                // Clear last-archive state on each new broadcast so the
+                // summary card doesn't render a stale share button before
+                // this broadcast's archive lands.
+                lastArchiveURL = nil
+                lastArchiveBytes = 0
                 startTicker()
             case .stopped, .idle, .failed:
                 // Detect a live→terminal transition specifically — opening
@@ -65,8 +91,16 @@ public final class LiveStreamControlViewModel: ObservableObject {
                 // (`totalListeners`, `peakListenerCount`, `reactionTotals`)
                 // stay so the post-session view can show them.
                 floatingReactions.removeAll()
+                // Health classification is a live-session concept — reset
+                // so the next broadcast starts neutral.
+                streamHealth = .healthy
+                streamHealthReason = ""
                 if case .failed(let error) = newState {
-                    lastErrorMessage = String(describing: error)
+                    // Prefer the user-facing description so the broadcaster
+                    // sheet shows "can't reach the streaming server (api.carnyx.app)"
+                    // instead of "backendUnreachable(...)". The raw enum still
+                    // ends up in os.Logger for engineers.
+                    lastErrorMessage = error.userFacingDescription
                 }
             default:
                 break
@@ -94,6 +128,12 @@ public final class LiveStreamControlViewModel: ObservableObject {
             }
         case .latencyMeasured(let ms):
             latencyMilliseconds = ms
+        case .streamHealthChanged(let health, let reason):
+            streamHealth = health
+            streamHealthReason = reason
+        case .archiveSaved(let url, let byteCount):
+            lastArchiveURL = url
+            lastArchiveBytes = byteCount
         default:
             break
         }
@@ -169,6 +209,8 @@ public final class LiveStreamControlViewModel: ObservableObject {
         lastErrorMessage = nil
         do {
             _ = try await startHandler()
+        } catch let liveError as LiveStreamError {
+            lastErrorMessage = liveError.userFacingDescription
         } catch {
             lastErrorMessage = String(describing: error)
         }

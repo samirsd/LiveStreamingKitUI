@@ -4,9 +4,17 @@ import LiveStreamingKit
 @MainActor
 public struct LiveStreamControlView: View {
     @ObservedObject public var viewModel: LiveStreamControlViewModel
+    /// Optional handler for the "share broadcast" button in the
+    /// post-broadcast summary card. Hosts wire this to a UIActivity sheet
+    /// or in-app share flow; nil hides the share affordance entirely.
+    public var onShareArchive: ((URL) -> Void)?
 
-    public init(viewModel: LiveStreamControlViewModel) {
+    public init(
+        viewModel: LiveStreamControlViewModel,
+        onShareArchive: ((URL) -> Void)? = nil
+    ) {
         self.viewModel = viewModel
+        self.onShareArchive = onShareArchive
     }
 
     public var body: some View {
@@ -14,6 +22,7 @@ public struct LiveStreamControlView: View {
             VStack(alignment: .leading, spacing: 16) {
                 header
                 primaryButton
+                errorBanner
                 metricsRow
                 reactionTotalsRow
                 listenerLinkSection
@@ -47,6 +56,9 @@ public struct LiveStreamControlView: View {
                     totalListeners: viewModel.totalListeners,
                     peakListenerCount: viewModel.peakListenerCount,
                     reactionTotals: viewModel.reactionTotals,
+                    archiveURL: viewModel.lastArchiveURL,
+                    archiveBytes: viewModel.lastArchiveBytes,
+                    onShareArchive: onShareArchive,
                     onDismiss: { viewModel.acknowledgeBroadcastEnd() }
                 )
                 .transition(.scale(scale: 0.92).combined(with: .opacity))
@@ -56,8 +68,23 @@ public struct LiveStreamControlView: View {
     }
 
     private var header: some View {
-        HStack {
+        HStack(spacing: 8) {
             LiveStreamStatusBadge(state: viewModel.state)
+            if let host = viewModel.streamingHostLabel {
+                Text(host)
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(
+                        RoundedRectangle(cornerRadius: 4, style: .continuous)
+                            .fill(Color.secondary.opacity(0.12))
+                    )
+                    .accessibilityLabel("streaming to \(host)")
+            }
+            if viewModel.isLive {
+                healthChip
+            }
             Spacer()
             if viewModel.isLive {
                 Text(viewModel.formattedUptime)
@@ -65,6 +92,46 @@ public struct LiveStreamControlView: View {
                     .foregroundStyle(.secondary)
             }
         }
+    }
+
+    /// Compact health indicator shown next to the live badge while the
+    /// broadcast is active. Visible only when the engine reports a non-
+    /// healthy state — healthy is the default-quiet design, so the chip
+    /// appears precisely when the broadcaster needs to look.
+    @ViewBuilder
+    private var healthChip: some View {
+        switch viewModel.streamHealth {
+        case .healthy:
+            EmptyView()
+        case .degraded:
+            healthBadge(
+                tint: .yellow,
+                label: "degraded",
+                detail: viewModel.streamHealthReason
+            )
+        case .failing:
+            healthBadge(
+                tint: .red,
+                label: "stream failing",
+                detail: viewModel.streamHealthReason
+            )
+        }
+    }
+
+    private func healthBadge(tint: Color, label: String, detail: String) -> some View {
+        HStack(spacing: 4) {
+            Circle().fill(tint).frame(width: 6, height: 6)
+            Text(label)
+                .font(.caption2.weight(.medium))
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 3)
+        .background(
+            RoundedRectangle(cornerRadius: 4, style: .continuous)
+                .fill(tint.opacity(0.18))
+        )
+        .accessibilityLabel(detail.isEmpty ? label : "\(label): \(detail)")
+        .help(detail)
     }
 
     private var primaryButton: some View {
@@ -189,6 +256,38 @@ public struct LiveStreamControlView: View {
         Text(LiveStreamCopy.recordingPreservedNote)
             .font(.caption2)
             .foregroundStyle(.secondary)
+    }
+
+    /// Inline error surface for the last broadcast attempt. Sits directly
+    /// under the primary button so the cause of a failed-to-go-live tap is
+    /// always visible — previously the view model set `lastErrorMessage`
+    /// but no view rendered it, so failures looked exactly like silence to
+    /// the user.
+    @ViewBuilder
+    private var errorBanner: some View {
+        if let message = viewModel.lastErrorMessage {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                    .font(.caption)
+                    .padding(.top, 2)
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.primary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(Color.orange.opacity(0.12))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(Color.orange.opacity(0.32), lineWidth: 0.5)
+            )
+            .accessibilityIdentifier("livestream.errorBanner")
+        }
     }
 }
 
