@@ -68,28 +68,40 @@ public struct LiveStreamControlView: View {
     }
 
     private var header: some View {
+        // The header has up to four pieces (badge, host chip, health chip,
+        // uptime) and on a narrow iPhone they can collide. Two safeguards:
+        // (1) host chip gets `lineLimit(1)` + middle truncation + a soft
+        // width cap so a long ngrok hostname can't push the rest off
+        // screen; (2) the whole row is `minWidth: 0` so SwiftUI lets the
+        // chip shrink rather than overflowing the sheet.
         HStack(spacing: 8) {
             LiveStreamStatusBadge(state: viewModel.state)
+                .layoutPriority(1)
             if let host = viewModel.streamingHostLabel {
                 Text(host)
                     .font(.caption2.monospaced())
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)
                     .background(
                         RoundedRectangle(cornerRadius: 4, style: .continuous)
                             .fill(Color.secondary.opacity(0.12))
                     )
+                    .frame(maxWidth: 160, alignment: .leading)
                     .accessibilityLabel("streaming to \(host)")
             }
             if viewModel.isLive {
                 healthChip
+                    .layoutPriority(1)
             }
-            Spacer()
+            Spacer(minLength: 4)
             if viewModel.isLive {
                 Text(viewModel.formattedUptime)
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
+                    .layoutPriority(1)
             }
         }
     }
@@ -159,20 +171,25 @@ public struct LiveStreamControlView: View {
     }
 
     private var metricsRow: some View {
+        // On a narrow sheet the previous 3-column layout (~118pt/column on
+        // iPhone) cramped the latency + segments values into the same
+        // visual mass as their labels. New layout puts the listener-count
+        // column on its own row (where it has room for the "+N joined"
+        // toast it owns) and pairs latency + segments on the row below.
         VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 12) {
+                ListenerCountChip(
+                    count: viewModel.listenerCount,
+                    toastEnabled: viewModel.isLive
+                )
+                Spacer(minLength: 0)
+            }
+            if viewModel.totalListeners > 0 || viewModel.peakListenerCount > 0 {
+                Text(lifetimeStatsCopy)
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
             HStack(alignment: .top, spacing: 16) {
-                VStack(alignment: .leading, spacing: 4) {
-                    ListenerCountChip(
-                        count: viewModel.listenerCount,
-                        toastEnabled: viewModel.isLive
-                    )
-                    if viewModel.totalListeners > 0 || viewModel.peakListenerCount > 0 {
-                        Text(lifetimeStatsCopy)
-                            .font(.caption2.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
                 metric(value: viewModel.latencyText, label: LiveStreamCopy.latency)
                 metric(value: "\(viewModel.segmentsSent)", label: LiveStreamCopy.segmentsSent)
             }
@@ -205,16 +222,20 @@ public struct LiveStreamControlView: View {
             return (type, n)
         }
         if !nonZero.isEmpty {
-            HStack(spacing: 14) {
+            // Smaller spacing on the totals row so 5 emoji+count pairs
+            // (each ~32pt) fit comfortably even at iPhone-mini width.
+            HStack(spacing: 12) {
                 ForEach(nonZero, id: \.0) { type, count in
                     HStack(spacing: 4) {
                         Text(LiveStreamReactionDisplay.emoji[type] ?? "·")
                         Text("\(count)")
                             .font(.caption.weight(.semibold).monospacedDigit())
                             .foregroundStyle(.secondary)
+                            .monospacedDigit()
                     }
+                    .fixedSize()
                 }
-                Spacer()
+                Spacer(minLength: 0)
             }
         }
     }
