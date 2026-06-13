@@ -2,6 +2,7 @@ import Foundation
 import Combine
 import SwiftUI
 import LiveStreamingKit
+import LoggingKit
 
 @MainActor
 public final class LiveStreamControlViewModel: ObservableObject {
@@ -149,8 +150,20 @@ public final class LiveStreamControlViewModel: ObservableObject {
     public func toggle() async {
         switch state {
         case .idle, .stopped, .failed:
+            VisibilityDiagnostics.trackFeatureAction(
+                surface: .liveStreaming,
+                feature: "broadcast_control",
+                action: "go_live",
+                phase: .started
+            )
             await start()
         case .live, .preparing:
+            VisibilityDiagnostics.trackFeatureAction(
+                surface: .liveStreaming,
+                feature: "broadcast_control",
+                action: "stop_live",
+                phase: .started
+            )
             await stop()
         case .stopping:
             break
@@ -211,8 +224,22 @@ public final class LiveStreamControlViewModel: ObservableObject {
             _ = try await startHandler()
         } catch let liveError as LiveStreamError {
             lastErrorMessage = liveError.userFacingDescription
+            VisibilityDiagnostics.trackFeatureAction(
+                surface: .liveStreaming,
+                feature: "broadcast_control",
+                action: "go_live",
+                phase: .failed,
+                properties: ["error_message": liveError.telemetryCategory]
+            )
         } catch {
             lastErrorMessage = String(describing: error)
+            VisibilityDiagnostics.trackFeatureAction(
+                surface: .liveStreaming,
+                feature: "broadcast_control",
+                action: "go_live",
+                phase: .failed,
+                properties: ["error_message": String(describing: error)]
+            )
         }
     }
 

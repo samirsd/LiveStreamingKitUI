@@ -1,4 +1,5 @@
 import SwiftUI
+import LoggingKit
 
 /// One-shot celebration card that surfaces after the broadcaster ends a set.
 ///
@@ -104,6 +105,13 @@ public struct BroadcastSummaryCard: View {
     private var shareBroadcastSection: some View {
         if let url = archiveURL, let onShare = onShareArchive {
             Button {
+                VisibilityDiagnostics.trackFeatureAction(
+                    surface: .liveStreaming,
+                    feature: "broadcast_archive",
+                    action: "share",
+                    phase: .started,
+                    properties: ["file_size_bytes": "\(archiveBytes)"]
+                )
                 onShare(url)
             } label: {
                 HStack(spacing: 8) {
