@@ -1,4 +1,5 @@
 import SwiftUI
+import LoggingKit
 
 #if canImport(UIKit)
 import UIKit
@@ -32,6 +33,12 @@ public struct LiveStreamCopyURLButton: View {
         NSPasteboard.general.setString(url.absoluteString, forType: .string)
         #endif
         copied = true
+        VisibilityDiagnostics.trackFeatureAction(
+            surface: .liveStreaming,
+            feature: "listener_link",
+            action: "copy",
+            phase: .completed
+        )
         Task {
             try? await Task.sleep(nanoseconds: 1_500_000_000)
             copied = false
