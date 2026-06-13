@@ -30,10 +30,10 @@ let package = Package(
     dependencies: [
         useLocalDependencies ?
             .package(path: "../LiveStreamingKit") :
-            .package(url: "https://github.com/samirsd/LiveStreamingKit.git", from: "0.1.0"),
+            .package(url: "https://github.com/samirsd/LiveStreamingKit.git", from: "1.0.11"),
         useLocalDependencies ?
             .package(path: "../LoggingKit") :
-            .package(url: "https://github.com/samirsd/LoggingKit.git", from: "1.0.0"),
+            .package(url: "https://github.com/samirsd/LoggingKit.git", from: "1.0.11"),
     ],
     targets: [
         .target(
