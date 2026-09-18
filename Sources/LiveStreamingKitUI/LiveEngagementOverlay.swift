@@ -128,6 +128,6 @@ public struct LiveEngagementOverlay: View {
     /// pending broadcasts (status hasn't moved off "pending") reject 409
     /// from the backend so we disable the buttons proactively.
     private var canReact: Bool {
-        controller.sessionStatus != "pending"
+        controller.canReact
     }
 }

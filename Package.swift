@@ -30,7 +30,7 @@ let package = Package(
     dependencies: [
         useLocalDependencies ?
             .package(path: "../LiveStreamingKit") :
-            .package(url: "https://github.com/samirsd/LiveStreamingKit.git", from: "1.0.11"),
+            .package(url: "https://github.com/samirsd/LiveStreamingKit.git", from: "1.0.14"),
         useLocalDependencies ?
             .package(path: "../LoggingKit") :
             .package(url: "https://github.com/samirsd/LoggingKit.git", from: "1.0.11"),

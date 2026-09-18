@@ -1,58 +1,37 @@
 import Foundation
+import Combine
 import LiveStreamingKit
 
-/// Facade that wires a `liveListener` deep link into the host app's
-/// playback stack and surfaces the engagement chrome.
-///
-/// The coordinator owns three concerns:
-/// 1. Driving playback through an injected `LiveListenerPlaybackBridge`
-///    (the app implements this, typically wrapping its existing audio
-///    playback manager).
-/// 2. Building + lifecycle-ing a `LiveStreamEngagementController` per
-///    session, exposed via `@Published var engagement` for SwiftUI hosts
-///    to bind to.
-/// 3. Deduping re-presentations of the same session id so rapid taps
-///    don't restart playback or double-mount the overlay.
-///
-/// Designed to be created once at the composition root and reused for the
-/// lifetime of the app. Host views observe `engagement` going non-nil and
-/// present `LiveEngagementOverlay`; the bundled `liveListenerSheet`
-/// modifier does this with one line of glue.
+/// Owns one listener presentation and its playback. Replacing or dismissing
+/// a presentation invalidates its work before waiting for network teardown.
 @MainActor
 public final class LiveListenerCoordinator: ObservableObject {
-
-    /// Currently-active engagement controller, or nil when no listener
-    /// session is presenting. Drives sheet/overlay visibility on hosts.
     @Published public private(set) var engagement: LiveStreamEngagementController?
-
-    /// Last session id we tried to play. Internal dedupe key.
-    private var presentedSessionID: String?
 
     private let client: LiveStreamClient
     private let playback: any LiveListenerPlaybackBridge
+    private var generation: UInt64 = 0
+    private var statusSubscription: AnyCancellable?
+    private var playbackStarted = false
 
     public init(client: LiveStreamClient, playback: any LiveListenerPlaybackBridge) {
         self.client = client
         self.playback = playback
     }
 
-    /// Push a live session into the host's player and start the engagement
-    /// stream. Idempotent for the same `sessionID` while it's presenting.
     public func present(sessionID: String, source: String?) async {
-        if presentedSessionID == sessionID, engagement != nil {
+        if let current = engagement, current.sessionID == sessionID {
+            if current.lastErrorMessage != nil {
+                await retry(ifPresenting: current)
+            }
             return
         }
-        await teardownCurrentEngagement()
 
-        // Resolve the master playlist against the same base URL the
-        // client targets, then hand off to the bridge. The bridge owns
-        // the popup-bar / now-playing / audio-session details — this
-        // coordinator never touches them.
-        let masterURL = URL(
-            string: "/live/\(sessionID)/master.m3u8",
-            relativeTo: client.baseURL
-        )?.absoluteURL ?? client.baseURL
-        playback.playLiveStream(url: masterURL, title: "live broadcast", sessionID: sessionID)
+        generation &+= 1
+        let requestGeneration = generation
+        let previous = detachCurrentEngagement()
+        await previous?.stop()
+        guard generation == requestGeneration, !Task.isCancelled else { return }
 
         let controller = LiveStreamEngagementController(
             sessionID: sessionID,
@@ -60,25 +39,61 @@ public final class LiveListenerCoordinator: ObservableObject {
             source: source
         )
         engagement = controller
-        presentedSessionID = sessionID
+        statusSubscription = controller.$sessionStatus.sink { [weak self, weak controller] status in
+            guard let self, let controller, self.engagement === controller else { return }
+            self.updatePlayback(status: status, sessionID: controller.sessionID)
+        }
         await controller.start()
     }
 
-    /// Tear down the listener presentation. Safe to call when nothing is
-    /// presenting. Stops both engagement polling and the underlying
-    /// stream playback.
     public func dismiss() async {
-        await teardownCurrentEngagement()
-        playback.stopLiveStream()
+        generation &+= 1
+        let previous = detachCurrentEngagement()
+        await previous?.stop()
     }
 
-    // MARK: - Internals
+    /// Sheet callbacks carry their original controller so an old sheet's
+    /// dismissal cannot close a newer presentation.
+    public func dismiss(ifPresenting controller: LiveStreamEngagementController) async {
+        guard engagement === controller else { return }
+        await dismiss()
+    }
 
-    private func teardownCurrentEngagement() async {
-        if let current = engagement {
-            await current.stop()
-        }
+    public func retry(ifPresenting controller: LiveStreamEngagementController) async {
+        guard engagement === controller, !controller.isLoading else { return }
+        let requestGeneration = generation
+        playback.stopLiveStream()
+        playbackStarted = false
+        await controller.stop()
+        guard generation == requestGeneration, engagement === controller else { return }
+        await controller.start()
+    }
+
+    private func detachCurrentEngagement() -> LiveStreamEngagementController? {
+        let previous = engagement
+        statusSubscription = nil
         engagement = nil
-        presentedSessionID = nil
+        playbackStarted = false
+        if previous != nil { playback.stopLiveStream() }
+        return previous
+    }
+
+    private func updatePlayback(status: String, sessionID: String) {
+        switch status {
+        case "live", "ended":
+            guard !playbackStarted else { return }
+            let rootURL = URL(string: "/", relativeTo: client.baseURL)?.absoluteURL ?? client.baseURL
+            let masterURL = rootURL
+                .appendingPathComponent("live")
+                .appendingPathComponent(sessionID)
+                .appendingPathComponent("master.m3u8")
+            playback.playLiveStream(url: masterURL, title: "live broadcast", sessionID: sessionID)
+            playbackStarted = true
+        case "failed":
+            if playbackStarted { playback.stopLiveStream() }
+            playbackStarted = false
+        default:
+            break
+        }
     }
 }

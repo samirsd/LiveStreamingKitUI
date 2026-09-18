@@ -47,8 +47,8 @@ final class LiveStreamControlViewModelAdvancedTests: XCTestCase {
     }
 
     func testStartHandlerErrorIsCapturedInLastErrorMessage() async {
-        struct BoomError: Error, CustomStringConvertible {
-            let description = "boom"
+        struct BoomError: LocalizedError {
+            var errorDescription: String? { "audio source is unavailable" }
         }
         let viewModel = LiveStreamControlViewModel(
             startHandler: { throw BoomError() },
@@ -56,7 +56,7 @@ final class LiveStreamControlViewModelAdvancedTests: XCTestCase {
         )
         await viewModel.toggle()
         XCTAssertNotNil(viewModel.lastErrorMessage)
-        XCTAssertTrue((viewModel.lastErrorMessage ?? "").contains("boom"))
+        XCTAssertEqual(viewModel.lastErrorMessage, "audio source is unavailable")
     }
 
     func testStopHandlerIsInvokedWhenLive() async {

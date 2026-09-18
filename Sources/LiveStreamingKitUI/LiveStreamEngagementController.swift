@@ -23,6 +23,8 @@ public final class LiveStreamEngagementController: ObservableObject {
     @Published public private(set) var floatingReactions: [LiveReactionEvent] = []
     @Published public private(set) var sessionStatus: String = "pending"
     @Published public private(set) var hasLoadedInitialState: Bool = false
+    @Published public private(set) var isLoading: Bool = false
+    @Published public private(set) var lastErrorMessage: String?
 
     /// Float duration matches the broadcaster's `LiveStreamControlViewModel`
     /// and the web listener page — same reaction surfaces for the same
@@ -35,6 +37,7 @@ public final class LiveStreamEngagementController: ObservableObject {
     private let client: LiveStreamClient
     private var poller: LiveStreamSocialPoller?
     private var session: LiveStreamSession?
+    private var lifecycleID: UUID?
 
     public init(
         sessionID: String,
@@ -46,16 +49,23 @@ public final class LiveStreamEngagementController: ObservableObject {
         self.source = source
     }
 
+    deinit {
+        if let poller { Task { await poller.stop() } }
+    }
+
     // MARK: - Lifecycle
 
-    /// Fetch the initial session snapshot and start the social poller.
-    /// Idempotent — calling again with the same id is a no-op once the
-    /// initial state has loaded.
+    /// Failed initial loads can be retried. Every asynchronous continuation
+    /// checks ownership so stopping during a request cannot restart polling.
     public func start() async {
-        if hasLoadedInitialState { return }
+        guard !isLoading, poller == nil else { return }
+        let lifecycleID = UUID()
+        self.lifecycleID = lifecycleID
+        isLoading = true
+        lastErrorMessage = nil
+        hasLoadedInitialState = false
+        sessionStatus = "pending"
 
-        // Synthesize a session struct for the poller — listener endpoints
-        // are anonymous so the ingest token is unused.
         let placeholder = LiveStreamSession(
             id: sessionID,
             ingestToken: "",
@@ -65,51 +75,66 @@ public final class LiveStreamEngagementController: ObservableObject {
         )
         session = placeholder
 
-        if let status = await client.fetchSessionStatus(placeholder) {
-            sessionStatus = status.status
-            listenerCount = status.listener_count ?? 0
-            totalListeners = status.total_listeners ?? 0
-            peakListenerCount = status.peak_listener_count ?? 0
-            reactionTotals = status.reaction_totals ?? [:]
+        let status = await client.fetchSessionStatus(placeholder)
+        guard self.lifecycleID == lifecycleID else { return }
+        isLoading = false
+        guard !Task.isCancelled else {
+            lastErrorMessage = "connection cancelled. try again to listen."
+            return
         }
+        guard let status else {
+            lastErrorMessage = "couldn’t load this broadcast. check your connection and try again."
+            return
+        }
+        listenerCount = status.listener_count ?? 0
+        totalListeners = status.total_listeners ?? 0
+        peakListenerCount = status.peak_listener_count ?? 0
+        reactionTotals = status.reaction_totals ?? [:]
         hasLoadedInitialState = true
+        sessionStatus = status.status
 
         let onEvent: @Sendable (LiveStreamEvent) -> Void = { [weak self] event in
-            Task { @MainActor in self?.ingest(event) }
+            Task { @MainActor in
+                guard let self, self.lifecycleID == lifecycleID else { return }
+                self.ingest(event)
+            }
         }
         let poller = LiveStreamSocialPoller(client: client, onEvent: onEvent)
         self.poller = poller
-        Task { [poller, placeholder] in
-            await poller.start(placeholder)
-        }
+        await poller.start(placeholder)
+        if self.lifecycleID != lifecycleID { await poller.stop() }
     }
 
-    /// Stop polling. Floating reactions still on screen are left to expire
-    /// naturally — they're decorative.
     public func stop() async {
-        if let poller {
-            await poller.stop()
-        }
+        lifecycleID = nil
+        isLoading = false
+        let previous = poller
         poller = nil
+        session = nil
+        await previous?.stop()
     }
 
     /// Fire a reaction. Surfaces a local optimistic float immediately and
     /// POSTs in the background. POST failure is silent — the user already
     /// saw the float, and the poll loop will dedupe the server-side echo.
     public func sendReaction(type: String) {
+        guard canReact, let session else { return }
         let local = LiveReactionEvent(
             id: "local-\(UUID().uuidString)",
             type: type,
             ts: Date().timeIntervalSince1970
         )
         appendFloatingReaction(local)
-        guard let session else { return }
         Task { [client] in
             _ = await client.postReaction(session, type: type)
         }
     }
 
     // MARK: - Convenience for the chrome overlay
+
+    public var canReact: Bool {
+        lifecycleID != nil && hasLoadedInitialState && (sessionStatus == "live" || sessionStatus == "ended")
+    }
 
     public var isLive: Bool { sessionStatus == "live" }
     public var isEnded: Bool { sessionStatus == "ended" || sessionStatus == "failed" }
@@ -122,6 +147,8 @@ public final class LiveStreamEngagementController: ObservableObject {
 
     private func ingest(_ event: LiveStreamEvent) {
         switch event {
+        case .sessionStatusChanged(let status):
+            sessionStatus = status
         case .listenerCountChanged(let n):
             listenerCount = n
         case .lifetimeListenerStatsChanged(let total, let peak):

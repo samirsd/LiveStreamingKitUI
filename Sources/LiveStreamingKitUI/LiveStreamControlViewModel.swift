@@ -15,8 +15,8 @@ public final class LiveStreamControlViewModel: ObservableObject {
     @Published public private(set) var peakListenerCount: Int = 0
     @Published public private(set) var reactionTotals: [String: Int] = [:]
     @Published public private(set) var floatingReactions: [LiveReactionEvent] = []
-    /// Flips true for one tick when the broadcaster's session transitions
-    /// from ``.live`` to any terminal state. Consumers observe this to
+    /// Becomes true when a broadcast that went live reaches a terminal
+    /// state, including after the intermediate stopping state. Consumers observe this to
     /// surface the post-broadcast summary card. Reset to false by calling
     /// ``acknowledgeBroadcastEnd()``.
     @Published public private(set) var justEndedBroadcast: Bool = false
@@ -55,6 +55,11 @@ public final class LiveStreamControlViewModel: ObservableObject {
     private let stopHandler: StopHandler
     private var liveStartedAt: Date?
     private var tickerTask: Task<Void, Never>?
+    private var startupTask: Task<LiveStreamSession, Error>?
+    @Published private var isStartingCommand = false
+    @Published private var isStoppingCommand = false
+    private var startWasCancelled = false
+    private var broadcastReachedLive = false
 
     public init(startHandler: @escaping StartHandler, stopHandler: @escaping StopHandler) {
         self.startHandler = startHandler
@@ -67,23 +72,25 @@ public final class LiveStreamControlViewModel: ObservableObject {
             let previousState = state
             state = newState
             switch newState {
+            case .preparing:
+                if previousState != .preparing {
+                    resetBroadcastMetrics()
+                }
             case .live(let session, let since):
+                if !broadcastReachedLive, previousState != .preparing {
+                    resetBroadcastMetrics()
+                }
+                broadcastReachedLive = true
                 activeSession = session
                 liveStartedAt = since
-                // Clear last-archive state on each new broadcast so the
-                // summary card doesn't render a stale share button before
-                // this broadcast's archive lands.
-                lastArchiveURL = nil
-                lastArchiveBytes = 0
+                lastErrorMessage = nil
                 startTicker()
             case .stopped, .idle, .failed:
-                // Detect a live→terminal transition specifically — opening
-                // a fresh view that already shows the terminal state doesn't
-                // trigger the celebration. The flag stays set until the
-                // consumer calls acknowledgeBroadcastEnd().
-                if case .live = previousState {
+                if broadcastReachedLive {
                     justEndedBroadcast = true
+                    broadcastReachedLive = false
                 }
+                listenerCount = 0
                 activeSession = nil
                 liveStartedAt = nil
                 stopTicker()
@@ -102,6 +109,8 @@ public final class LiveStreamControlViewModel: ObservableObject {
                     // instead of "backendUnreachable(...)". The raw enum still
                     // ends up in os.Logger for engineers.
                     lastErrorMessage = error.userFacingDescription
+                } else if case .stopped(let reason) = newState {
+                    lastErrorMessage = recoveryMessage(for: reason)
                 }
             default:
                 break
@@ -117,6 +126,7 @@ public final class LiveStreamControlViewModel: ObservableObject {
         case .reactionTotalsChanged(let totals):
             reactionTotals = totals
         case .reactionReceived(let reaction):
+            guard isLive else { return }
             // Append + auto-prune after `reactionFloatDuration`. We schedule
             // the prune off the same MainActor we're running on so the
             // @Published mutation is safe.
@@ -130,6 +140,7 @@ public final class LiveStreamControlViewModel: ObservableObject {
         case .latencyMeasured(let ms):
             latencyMilliseconds = ms
         case .streamHealthChanged(let health, let reason):
+            guard isLive else { return }
             streamHealth = health
             streamHealthReason = reason
         case .archiveSaved(let url, let byteCount):
@@ -147,34 +158,74 @@ public final class LiveStreamControlViewModel: ObservableObject {
         justEndedBroadcast = false
     }
 
+    /// Compatibility action for a single start/stop control. Intent-specific
+    /// callers should use startBroadcast or stopBroadcast so a repeated start
+    /// request can never accidentally stop a broadcast that just became live.
     public func toggle() async {
         switch state {
         case .idle, .stopped, .failed:
-            VisibilityDiagnostics.trackFeatureAction(
-                surface: .liveStreaming,
-                feature: "broadcast_control",
-                action: "go_live",
-                phase: .started
-            )
-            await start()
+            await startBroadcast()
         case .live, .preparing:
-            VisibilityDiagnostics.trackFeatureAction(
-                surface: .liveStreaming,
-                feature: "broadcast_control",
-                action: "stop_live",
-                phase: .started
-            )
-            await stop()
+            await stopBroadcast()
         case .stopping:
             break
         }
     }
 
+    public func startBroadcast() async {
+        guard !isStartingCommand, !isStoppingCommand else { return }
+        switch state {
+        case .idle, .stopped, .failed: break
+        case .preparing, .live, .stopping: return
+        }
+        // Reserve the action before suspending; engine events arrive through
+        // an asynchronous bridge and may not yet reflect this request.
+        isStartingCommand = true
+        startWasCancelled = false
+        resetBroadcastMetrics()
+        defer { isStartingCommand = false }
+        VisibilityDiagnostics.trackFeatureAction(
+            surface: .liveStreaming,
+            feature: "broadcast_control",
+            action: "go_live",
+            phase: .started
+        )
+        await start()
+    }
+
+    public func stopBroadcast() async {
+        guard !isStoppingCommand else { return }
+        let canStop: Bool
+        switch state {
+        case .live, .preparing: canStop = true
+        case .idle, .stopped, .failed: canStop = isStartingCommand
+        case .stopping: canStop = false
+        }
+        guard canStop else { return }
+        isStoppingCommand = true
+        startWasCancelled = isStartingCommand || state == .preparing
+        startupTask?.cancel()
+        defer { isStoppingCommand = false }
+        VisibilityDiagnostics.trackFeatureAction(
+            surface: .liveStreaming,
+            feature: "broadcast_control",
+            action: "stop_live",
+            phase: .started
+        )
+        await stopHandler()
+    }
+
     public var isWorking: Bool {
+        if isStartingCommand || isStoppingCommand { return true }
         switch state {
         case .preparing, .stopping: return true
         default: return false
         }
+    }
+
+    public var canCancelStart: Bool {
+        !startWasCancelled && !isStoppingCommand && state != .stopping
+            && (isStartingCommand || state == .preparing)
     }
 
     public var isLive: Bool {
@@ -183,6 +234,8 @@ public final class LiveStreamControlViewModel: ObservableObject {
     }
 
     public var primaryButtonTitle: String {
+        if isStoppingCommand || (isStartingCommand && startWasCancelled) { return LiveStreamCopy.stopping }
+        if isStartingCommand { return LiveStreamCopy.starting }
         switch state {
         case .preparing: return LiveStreamCopy.starting
         case .stopping: return LiveStreamCopy.stopping
@@ -206,7 +259,7 @@ public final class LiveStreamControlViewModel: ObservableObject {
 
     public var formattedUptime: String {
         guard let liveStartedAt else { return "" }
-        let elapsed = Int(Date().timeIntervalSince(liveStartedAt))
+        let elapsed = max(0, Int(Date().timeIntervalSince(liveStartedAt)))
         let hours = elapsed / 3600
         let minutes = (elapsed % 3600) / 60
         let seconds = elapsed % 60
@@ -220,9 +273,22 @@ public final class LiveStreamControlViewModel: ObservableObject {
 
     private func start() async {
         lastErrorMessage = nil
+        let task = Task { @MainActor [startHandler] in
+            try Task.checkCancellation()
+            return try await startHandler()
+        }
+        startupTask = task
+        defer { startupTask = nil }
         do {
-            _ = try await startHandler()
+            _ = try await withTaskCancellationHandler {
+                try await task.value
+            } onCancel: {
+                task.cancel()
+            }
+        } catch is CancellationError {
+            // Cancelling startup is a user action, not a broadcast failure.
         } catch let liveError as LiveStreamError {
+            guard !startWasCancelled else { return }
             lastErrorMessage = liveError.userFacingDescription
             VisibilityDiagnostics.trackFeatureAction(
                 surface: .liveStreaming,
@@ -232,7 +298,9 @@ public final class LiveStreamControlViewModel: ObservableObject {
                 properties: ["error_message": liveError.telemetryCategory]
             )
         } catch {
-            lastErrorMessage = String(describing: error)
+            guard !startWasCancelled else { return }
+            lastErrorMessage = (error as? LocalizedError)?.errorDescription
+                ?? "couldn't start the broadcast — please try again"
             VisibilityDiagnostics.trackFeatureAction(
                 surface: .liveStreaming,
                 feature: "broadcast_control",
@@ -243,16 +311,49 @@ public final class LiveStreamControlViewModel: ObservableObject {
         }
     }
 
-    private func stop() async {
-        await stopHandler()
+    private func resetBroadcastMetrics() {
+        listenerCount = 0
+        totalListeners = 0
+        peakListenerCount = 0
+        reactionTotals = [:]
+        floatingReactions = []
+        segmentsSent = 0
+        latencyMilliseconds = 0
+        justEndedBroadcast = false
+        lastArchiveURL = nil
+        lastArchiveBytes = 0
+        lastErrorMessage = nil
+        streamHealth = .healthy
+        streamHealthReason = ""
+        broadcastReachedLive = false
+    }
+
+    private func recoveryMessage(for reason: LiveStreamState.StopReason) -> String? {
+        switch reason {
+        case .requested, .recordingEnded:
+            return nil
+        case .networkLost:
+            return "the broadcast ended because the connection was lost. check your network, then go live again."
+        case .backendClosed:
+            return "the streaming server ended this broadcast. try going live again."
+        case .appBackgrounded:
+            return "the broadcast ended when the app closed. go live again when you're ready."
+        case .interruptionTimedOut:
+            return "the broadcast ended after an audio interruption. check your audio source, then go live again."
+        }
     }
 
     private func startTicker() {
         stopTicker()
         tickerTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                await MainActor.run { self?.objectWillChange.send() }
+                do {
+                    try await Task.sleep(nanoseconds: 1_000_000_000)
+                } catch {
+                    return
+                }
+                guard let self else { return }
+                self.objectWillChange.send()
             }
         }
     }

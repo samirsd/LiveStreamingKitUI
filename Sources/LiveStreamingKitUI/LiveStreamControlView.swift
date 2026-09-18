@@ -18,91 +18,91 @@ public struct LiveStreamControlView: View {
     }
 
     public var body: some View {
-        ZStack(alignment: .topTrailing) {
+        ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                header
-                primaryButton
-                errorBanner
-                metricsRow
-                reactionTotalsRow
-                listenerLinkSection
-                footnote
-            }
-            .padding(20)
-            .background(
-                RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .fill(Color.secondary.opacity(0.06))
-            )
+                ZStack(alignment: .topTrailing) {
+                    VStack(alignment: .leading, spacing: 16) {
+                        header
+                        primaryButton
+                        errorBanner
+                        healthDetail
+                        metricsRow
+                        reactionTotalsRow
+                        listenerLinkSection
+                        archiveShareAction
+                        footnote
+                    }
+                    .padding(20)
+                    .background(
+                        RoundedRectangle(cornerRadius: 18, style: .continuous)
+                            .fill(Color.secondary.opacity(0.06))
+                    )
 
-            // Floating reactions overlay. Anchored top-right so the emoji
-            // float up alongside the listener-count metric. The view is
-            // pointer-event-transparent so the underlying controls still
-            // work.
-            FloatingReactionsOverlay(reactions: viewModel.floatingReactions)
-                .allowsHitTesting(false)
-                .padding(.top, 8)
-                .padding(.trailing, 12)
-        }
-        .overlay {
-            // The celebration card surfaces the moment a live broadcast
-            // ends with the broadcaster still on this view. Tapping
-            // "done" dismisses it (via acknowledgeBroadcastEnd) and the
-            // post-stream stats remain visible in the underlying surface.
-            if viewModel.justEndedBroadcast {
-                Color.black.opacity(0.25)
-                    .ignoresSafeArea()
-                    .transition(.opacity)
-                BroadcastSummaryCard(
-                    totalListeners: viewModel.totalListeners,
-                    peakListenerCount: viewModel.peakListenerCount,
-                    reactionTotals: viewModel.reactionTotals,
-                    archiveURL: viewModel.lastArchiveURL,
-                    archiveBytes: viewModel.lastArchiveBytes,
-                    onShareArchive: onShareArchive,
-                    onDismiss: { viewModel.acknowledgeBroadcastEnd() }
-                )
-                .transition(.scale(scale: 0.92).combined(with: .opacity))
+                    FloatingReactionsOverlay(reactions: viewModel.floatingReactions)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+                        .padding(.top, 8)
+                        .padding(.trailing, 12)
+                }
+
+                // Keep the result in the scrollable content so it cannot
+                // obscure a failure message or trap controls below a short
+                // sheet, including at accessibility text sizes.
+                if viewModel.justEndedBroadcast {
+                    BroadcastSummaryCard(
+                        totalListeners: viewModel.totalListeners,
+                        peakListenerCount: viewModel.peakListenerCount,
+                        reactionTotals: viewModel.reactionTotals,
+                        archiveURL: viewModel.lastArchiveURL,
+                        archiveBytes: viewModel.lastArchiveBytes,
+                        onShareArchive: onShareArchive,
+                        onDismiss: { viewModel.acknowledgeBroadcastEnd() }
+                    )
+                    .frame(maxWidth: .infinity)
+                }
             }
+            .padding(.bottom, 20)
         }
-        .animation(.spring(response: 0.32, dampingFraction: 0.78), value: viewModel.justEndedBroadcast)
     }
 
     private var header: some View {
-        // The header has up to four pieces (badge, host chip, health chip,
-        // uptime) and on a narrow iPhone they can collide. Two safeguards:
-        // (1) host chip gets `lineLimit(1)` + middle truncation + a soft
-        // width cap so a long ngrok hostname can't push the rest off
-        // screen; (2) the whole row is `minWidth: 0` so SwiftUI lets the
-        // chip shrink rather than overflowing the sheet.
-        HStack(spacing: 8) {
-            LiveStreamStatusBadge(state: viewModel.state)
-                .layoutPriority(1)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                LiveStreamStatusBadge(state: viewModel.state)
+                Spacer(minLength: 4)
+                if viewModel.isLive {
+                    Text(viewModel.formattedUptime)
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
             if let host = viewModel.streamingHostLabel {
                 Text(host)
                     .font(.caption2.monospaced())
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(
-                        RoundedRectangle(cornerRadius: 4, style: .continuous)
-                            .fill(Color.secondary.opacity(0.12))
-                    )
-                    .frame(maxWidth: 160, alignment: .leading)
                     .accessibilityLabel("streaming to \(host)")
             }
-            if viewModel.isLive {
+        }
+    }
+
+    @ViewBuilder
+    private var healthDetail: some View {
+        if viewModel.isLive, viewModel.streamHealth != .healthy {
+            VStack(alignment: .leading, spacing: 6) {
                 healthChip
-                    .layoutPriority(1)
-            }
-            Spacer(minLength: 4)
-            if viewModel.isLive {
-                Text(viewModel.formattedUptime)
-                    .font(.caption.monospacedDigit())
+                if !viewModel.streamHealthReason.isEmpty {
+                    Text(viewModel.streamHealthReason)
+                        .font(.caption)
+                }
+                Text("check your connection and audio source. if the stream doesn't recover, stop and go live again.")
+                    .font(.caption)
                     .foregroundStyle(.secondary)
-                    .layoutPriority(1)
             }
+            .fixedSize(horizontal: false, vertical: true)
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("livestream.healthDetail")
         }
     }
 
@@ -147,27 +147,42 @@ public struct LiveStreamControlView: View {
     }
 
     private var primaryButton: some View {
-        Button {
-            Task { await viewModel.toggle() }
-        } label: {
-            HStack(spacing: 10) {
-                if viewModel.isWorking {
-                    ProgressView().controlSize(.small)
+        VStack(spacing: 8) {
+            Button {
+                if viewModel.isLive {
+                    Task { await viewModel.stopBroadcast() }
+                } else {
+                    Task { await viewModel.startBroadcast() }
                 }
-                Text(viewModel.primaryButtonTitle)
-                    .font(.headline)
+            } label: {
+                HStack(spacing: 10) {
+                    if viewModel.isWorking {
+                        ProgressView().controlSize(.small)
+                    }
+                    Text(viewModel.primaryButtonTitle)
+                        .font(.headline)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 14)
+                .background(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(viewModel.primaryButtonTint)
+                )
+                .foregroundStyle(.white)
             }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 14)
-            .background(
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(viewModel.primaryButtonTint)
-            )
-            .foregroundStyle(.white)
+            .buttonStyle(.plain)
+            .disabled(viewModel.isWorking)
+            .accessibilityIdentifier("livestream.toggle")
+
+            if viewModel.canCancelStart {
+                Button("cancel startup") {
+                    Task { await viewModel.stopBroadcast() }
+                }
+                .font(.body)
+                .padding(.vertical, 8)
+                .accessibilityIdentifier("livestream.cancelStart")
+            }
         }
-        .buttonStyle(.plain)
-        .disabled(viewModel.isWorking)
-        .accessibilityIdentifier("livestream.toggle")
     }
 
     private var metricsRow: some View {
@@ -224,7 +239,7 @@ public struct LiveStreamControlView: View {
         if !nonZero.isEmpty {
             // Smaller spacing on the totals row so 5 emoji+count pairs
             // (each ~32pt) fit comfortably even at iPhone-mini width.
-            HStack(spacing: 12) {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 80), alignment: .leading)], alignment: .leading, spacing: 12) {
                 ForEach(nonZero, id: \.0) { type, count in
                     HStack(spacing: 4) {
                         Text(LiveStreamReactionDisplay.emoji[type] ?? "·")
@@ -235,7 +250,6 @@ public struct LiveStreamControlView: View {
                     }
                     .fixedSize()
                 }
-                Spacer(minLength: 0)
             }
         }
     }
@@ -247,8 +261,10 @@ public struct LiveStreamControlView: View {
             Text(label)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
     }
 
     @ViewBuilder
@@ -258,18 +274,32 @@ public struct LiveStreamControlView: View {
                 Text(LiveStreamCopy.listenerLabel)
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
-                HStack {
+                VStack(alignment: .leading, spacing: 8) {
                     Text(session.listenerURL.absoluteString)
                         .font(.caption.monospaced())
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    Spacer()
                     LiveStreamCopyURLButton(url: session.listenerURL)
                 }
                 Text(LiveStreamCopy.listenerHint)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
+        }
+    }
+
+    @ViewBuilder
+    private var archiveShareAction: some View {
+        if !viewModel.justEndedBroadcast,
+           let url = viewModel.lastArchiveURL,
+           let onShareArchive {
+            Button {
+                onShareArchive(url)
+            } label: {
+                Label("share broadcast", systemImage: "square.and.arrow.up")
+                    .frame(minHeight: 44)
+            }
+            .accessibilityIdentifier("livestream.shareArchive")
         }
     }
 

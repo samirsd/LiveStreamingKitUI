@@ -58,7 +58,7 @@ public struct BroadcastSummaryCard: View {
             VStack(spacing: 6) {
                 Text("\(totalListeners)")
                     .font(.largeTitle.weight(.bold).monospacedDigit())
-                Text(totalListeners == 1 ? LiveStreamCopy.listeners.dropLast() + " " : LiveStreamCopy.listeners)
+                Text(totalListeners == 1 ? "listener" : LiveStreamCopy.listeners)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -82,11 +82,13 @@ public struct BroadcastSummaryCard: View {
                     .kerning(1.5)
                     .padding(.horizontal, 24)
                     .padding(.vertical, 10)
+                    .frame(minHeight: 44)
                     .background(
                         Capsule().fill(Color.primary.opacity(0.08))
                     )
             }
             .buttonStyle(.plain)
+            .accessibilityIdentifier("livestream.summary.dismiss")
             .padding(.top, 8)
         }
         .padding(24)
@@ -104,33 +106,45 @@ public struct BroadcastSummaryCard: View {
     @ViewBuilder
     private var shareBroadcastSection: some View {
         if let url = archiveURL, let onShare = onShareArchive {
-            Button {
-                VisibilityDiagnostics.trackFeatureAction(
-                    surface: .liveStreaming,
-                    feature: "broadcast_archive",
-                    action: "share",
-                    phase: .started,
-                    properties: ["file_size_bytes": "\(archiveBytes)"]
-                )
-                onShare(url)
-            } label: {
-                HStack(spacing: 8) {
-                    Image(systemName: "square.and.arrow.up")
-                    Text("share broadcast")
-                        .font(.caption.weight(.semibold))
-                    if archiveBytes > 0 {
-                        Text(humanReadableSize(archiveBytes))
-                            .font(.caption2.monospacedDigit())
-                            .foregroundStyle(.secondary)
+            VStack(spacing: 6) {
+                Button {
+                    VisibilityDiagnostics.trackFeatureAction(
+                        surface: .liveStreaming,
+                        feature: "broadcast_archive",
+                        action: "share",
+                        phase: .started,
+                        properties: ["file_size_bytes": "\(archiveBytes)"]
+                    )
+                    onShare(url)
+                } label: {
+                    ViewThatFits(in: .horizontal) {
+                        Label("share broadcast", systemImage: "square.and.arrow.up")
+                            .fixedSize()
+                        VStack(spacing: 6) {
+                            Image(systemName: "square.and.arrow.up")
+                            Text("share broadcast")
+                                .multilineTextAlignment(.center)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                     }
+                    .font(.caption.weight(.semibold))
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+                    .frame(maxWidth: .infinity, minHeight: 44)
+                    .background(
+                        Capsule().stroke(Color.primary.opacity(0.18), lineWidth: 0.5)
+                    )
+                    .contentShape(Rectangle())
                 }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
-                .background(
-                    Capsule().stroke(Color.primary.opacity(0.18), lineWidth: 0.5)
-                )
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("livestream.summary.shareArchive")
+
+                if archiveBytes > 0 {
+                    Text(humanReadableSize(archiveBytes))
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
             }
-            .buttonStyle(.plain)
         }
     }
 
@@ -149,7 +163,7 @@ public struct BroadcastSummaryCard: View {
             return (type, n)
         }
         if !entries.isEmpty {
-            HStack(spacing: 16) {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 96))], spacing: 12) {
                 ForEach(entries, id: \.0) { type, count in
                     HStack(spacing: 4) {
                         Text(LiveStreamReactionDisplay.emoji[type] ?? "·")
