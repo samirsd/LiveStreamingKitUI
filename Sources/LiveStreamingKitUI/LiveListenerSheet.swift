@@ -36,7 +36,7 @@ private struct LiveListenerSheetModifier: ViewModifier {
 @MainActor
 private struct LiveListenerSheetContent: View {
     @ObservedObject var controller: LiveStreamEngagementController
-    let coordinator: LiveListenerCoordinator
+    @ObservedObject var coordinator: LiveListenerCoordinator
 
     var body: some View {
         ScrollView {
@@ -56,7 +56,29 @@ private struct LiveListenerSheetContent: View {
                     .accessibilityLabel("close and stop listening")
                 }
 
-                if controller.isLoading {
+                if coordinator.playbackState == .authorizing {
+                    ProgressView("checking listening access…")
+                } else if case .accessRequired(let requirement) = coordinator.playbackState {
+                    Text(requirement == .authenticationRequired
+                         ? "Sign in to check your Carnyx Pro access to this broadcast."
+                         : "Listen to this broadcast with Carnyx Pro. See available subscription and trial options.")
+                        .foregroundStyle(.secondary)
+                    if coordinator.canRequestAccess {
+                        Button(requirement == .authenticationRequired ? "Sign in to listen" : "See listening options") {
+                            coordinator.requestAccess(ifPresenting: controller)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .accessibilityIdentifier("livestream.listener.access")
+                    }
+                    retryButton(title: "check access again")
+                } else if case .failed(let message) = coordinator.playbackState {
+                    Text(message).foregroundStyle(.secondary)
+                    retryButton(title: "reconnect audio")
+                } else if coordinator.playbackState == .expired {
+                    Text("Reconnect to renew your listening access and keep listening.")
+                        .foregroundStyle(.secondary)
+                    retryButton(title: "reconnect audio")
+                } else if controller.isLoading {
                     ProgressView("connecting to broadcast…")
                 } else if let error = controller.lastErrorMessage {
                     Text(error)
@@ -84,6 +106,14 @@ private struct LiveListenerSheetContent: View {
     }
 
     private var title: String {
+        switch coordinator.playbackState {
+        case .authorizing: return "checking access"
+        case .accessRequired(.authenticationRequired): return "sign in to listen"
+        case .accessRequired: return "listen with Carnyx Pro"
+        case .failed: return "playback interrupted"
+        case .expired: return "reconnect to listen"
+        case .idle, .playing: break
+        }
         if controller.isLoading { return "connecting" }
         if controller.lastErrorMessage != nil { return "broadcast unavailable" }
         switch controller.sessionStatus {
@@ -99,6 +129,6 @@ private struct LiveListenerSheetContent: View {
             Task { await coordinator.retry(ifPresenting: controller) }
         }
         .buttonStyle(.bordered)
-        .disabled(controller.isLoading)
+        .disabled(controller.isLoading || coordinator.playbackState == .authorizing)
     }
 }

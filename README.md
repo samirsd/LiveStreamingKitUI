@@ -32,6 +32,20 @@ All animations honor `accessibilityReduceMotion` — the pulse, vibe glow, and r
 - `floatingReactions: [LiveReactionEvent]` (auto-pruned after `reactionFloatDuration`, default 1.8s)
 - `justEndedBroadcast: Bool` — flips true on `.live → .stopped/.failed`, reset via `acknowledgeBroadcastEnd()`
 
+### Pro listener integration
+
+`LiveListenerCoordinator` obtains an authenticated playback grant before starting
+audio. Its `playbackState` distinguishes access checks, sign-in/Pro requirements,
+connection failures, and grant expiry. `liveListenerSheet` renders those states.
+Provide `onAccessRequired` to open account sign-in or the broadcast's web listening
+options. Trial eligibility remains a checkout decision.
+
+Forward account identity changes to `authenticationDidChange()` and player errors
+to `playbackDidFail()`. Both stop owned audio and require explicit retry; retry
+always requests a fresh grant. On grant expiry, audio stops and the sheet offers
+reconnection rather than failing silently. Closing/replacing the presentation
+invalidates outstanding grant requests.
+
 ## Installation
 
 ```swift
