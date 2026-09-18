@@ -32,8 +32,6 @@ All animations honor `accessibilityReduceMotion` — the pulse, vibe glow, and r
 - `floatingReactions: [LiveReactionEvent]` (auto-pruned after `reactionFloatDuration`, default 1.8s)
 - `justEndedBroadcast: Bool` — flips true on `.live → .stopped/.failed`, reset via `acknowledgeBroadcastEnd()`
 
-## Installation
-
 ### Pro listener integration
 
 `LiveListenerCoordinator` obtains an authenticated playback grant before starting
