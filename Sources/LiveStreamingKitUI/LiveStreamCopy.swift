@@ -20,7 +20,7 @@ public enum LiveStreamCopy {
     public static let kbps = "kbps"
     public static let recordingPreservedNote = "if you're recording, it continues locally when the stream ends."
     public static let listenerLabel = "live link"
-    public static let listenerHint = "anyone with this link can listen to this set live."
+    public static let listenerHint = "listeners need carnyx pro. share this link for listening and trial options."
     public static let enableForNext = "stream the next recording"
     public static let titleField = "set name"
     public static let titlePlaceholder = "untitled set"

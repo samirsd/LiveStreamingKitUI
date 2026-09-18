@@ -102,11 +102,105 @@ final class LiveListenerLifecycleTests: XCTestCase {
         await coordinator.dismiss()
     }
 
+    func testProRejectionShowsListeningActionWithoutStartingAudioAndRetryGetsNewGrant() async {
+        let transport = ListenerTransport(grantCodes: [403, 200])
+        let playback = ListenerPlaybackSpy()
+        var requestedSession: String?
+        let coordinator = LiveListenerCoordinator(client: makeClient(transport), playback: playback,
+            onAccessRequired: { sessionID, error in
+                XCTAssertEqual(error, .subscriptionRequired)
+                requestedSession = sessionID
+            })
+        await coordinator.present(sessionID: "paid", source: "link")
+        let controller = coordinator.engagement!
+        XCTAssertEqual(coordinator.playbackState, .accessRequired(.subscriptionRequired))
+        XCTAssertTrue(playback.playedSessions.isEmpty)
+        coordinator.requestAccess(ifPresenting: controller)
+        XCTAssertEqual(requestedSession, "paid")
+        XCTAssertTrue(playback.playedSessions.isEmpty)
+
+        await coordinator.retry(ifPresenting: controller)
+        XCTAssertEqual(coordinator.playbackState, .playing)
+        XCTAssertEqual(playback.playedURLs.first?.query, "playback_token=grant-2")
+        let requests = await transport.grantRequestCount
+        XCTAssertEqual(requests, 2)
+        await coordinator.dismiss()
+    }
+
+    func testSignedOutServerResponseOffersSignInInsteadOfLiveAudio() async {
+        let transport = ListenerTransport(grantCodes: [401])
+        let playback = ListenerPlaybackSpy()
+        let coordinator = LiveListenerCoordinator(client: makeClient(transport), playback: playback)
+        await coordinator.present(sessionID: "sign-in", source: nil)
+        XCTAssertEqual(coordinator.playbackState, .accessRequired(.authenticationRequired))
+        XCTAssertTrue(playback.playedSessions.isEmpty)
+        await coordinator.dismiss()
+    }
+
+    func testDismissDuringGrantRequestDiscardsLateAuthorization() async {
+        let transport = ListenerTransport(holdFirstGrant: true)
+        let playback = ListenerPlaybackSpy()
+        let coordinator = LiveListenerCoordinator(client: makeClient(transport), playback: playback)
+        let present = Task { await coordinator.present(sessionID: "closing", source: nil) }
+        await transport.waitForFirstGrant()
+        XCTAssertEqual(coordinator.playbackState, .authorizing)
+        await coordinator.dismiss()
+        await transport.releaseFirstGrant()
+        await present.value
+        XCTAssertNil(coordinator.engagement)
+        XCTAssertEqual(coordinator.playbackState, .idle)
+        XCTAssertTrue(playback.playedSessions.isEmpty)
+    }
+
+    func testAccountChangeInvalidatesInFlightGrantAndStopsExistingPlayback() async {
+        let transport = ListenerTransport(holdFirstGrant: true)
+        let playback = ListenerPlaybackSpy()
+        let coordinator = LiveListenerCoordinator(client: makeClient(transport), playback: playback)
+        let present = Task { await coordinator.present(sessionID: "account", source: nil) }
+        await transport.waitForFirstGrant()
+        coordinator.authenticationDidChange()
+        await transport.releaseFirstGrant()
+        await present.value
+        XCTAssertTrue(playback.playedSessions.isEmpty)
+        if case .failed = coordinator.playbackState {} else { XCTFail("Must request explicit reconnection") }
+        await coordinator.retry(ifPresenting: coordinator.engagement!)
+        XCTAssertTrue(playback.isPlayingLiveStream)
+        coordinator.authenticationDidChange()
+        XCTAssertFalse(playback.isPlayingLiveStream)
+        await coordinator.dismiss()
+    }
+
+    func testGrantExpiryStopsAudioAndOffersExplicitRenewal() async {
+        let transport = ListenerTransport(grantLifetime: 0.2)
+        let playback = ListenerPlaybackSpy()
+        let coordinator = LiveListenerCoordinator(client: makeClient(transport), playback: playback)
+        await coordinator.present(sessionID: "expires", source: nil)
+        XCTAssertEqual(coordinator.playbackState, .playing)
+        try? await Task.sleep(for: .milliseconds(350))
+        XCTAssertEqual(coordinator.playbackState, .expired)
+        XCTAssertFalse(playback.isPlayingLiveStream)
+        await coordinator.retry(ifPresenting: coordinator.engagement!)
+        XCTAssertEqual(coordinator.playbackState, .playing)
+        XCTAssertEqual(playback.playedURLs.last?.query, "playback_token=grant-2")
+        await coordinator.dismiss()
+    }
+
+    func testPlayerFailureDoesNotLeaveListenerClaimingPlaybackIsActive() async {
+        let transport = ListenerTransport()
+        let playback = ListenerPlaybackSpy()
+        let coordinator = LiveListenerCoordinator(client: makeClient(transport), playback: playback)
+        await coordinator.present(sessionID: "error", source: nil)
+        coordinator.playbackDidFail()
+        XCTAssertFalse(playback.isPlayingLiveStream)
+        if case .failed = coordinator.playbackState {} else { XCTFail("Should offer reconnect") }
+        await coordinator.dismiss()
+    }
+
     private func makeClient(_ transport: ListenerTransport) -> LiveStreamClient {
         LiveStreamClient(
             config: LiveStreamConfig(
                 ingestBaseURL: URL(string: "https://example.test/")!,
-                authTokenProvider: { nil }
+                authTokenProvider: { "account-token" }
             ),
             transport: transport
         )
@@ -116,11 +210,13 @@ final class LiveListenerLifecycleTests: XCTestCase {
 @MainActor
 private final class ListenerPlaybackSpy: LiveListenerPlaybackBridge {
     var playedSessions: [String] = []
+    var playedURLs: [URL] = []
     var isPlayingLiveStream = false
     var onPlay: (() -> Void)?
 
     func playLiveStream(url: URL, title: String, sessionID: String) {
         playedSessions.append(sessionID)
+        playedURLs.append(url)
         isPlayingLiveStream = true
         onPlay?()
     }
@@ -130,6 +226,12 @@ private final class ListenerPlaybackSpy: LiveListenerPlaybackBridge {
 
 private actor ListenerTransport: HTTPTransport {
     private let holdFirstStatus: Bool
+    private let holdFirstGrant: Bool
+    private var grantCodes: [Int]
+    private let grantLifetime: TimeInterval
+    private var grantWaiters: [CheckedContinuation<Void, Never>] = []
+    private var grantResponse: CheckedContinuation<Void, Never>?
+    private(set) var grantRequestCount = 0
     private var statuses: [String]
     private var statusCodes: [Int]
     private var firstStatusWaiters: [CheckedContinuation<Void, Never>] = []
@@ -137,7 +239,10 @@ private actor ListenerTransport: HTTPTransport {
     private(set) var statusRequestCount = 0
     private(set) var reactionRequestCount = 0
 
-    init(holdFirstStatus: Bool = false, statuses: [String] = ["live"], statusCodes: [Int] = [200]) {
+    init(holdFirstStatus: Bool = false, statuses: [String] = ["live"], statusCodes: [Int] = [200], holdFirstGrant: Bool = false, grantCodes: [Int] = [200], grantLifetime: TimeInterval = 43200) {
+        self.holdFirstGrant = holdFirstGrant
+        self.grantCodes = grantCodes
+        self.grantLifetime = grantLifetime
         self.holdFirstStatus = holdFirstStatus
         self.statuses = statuses
         self.statusCodes = statusCodes
@@ -153,11 +258,34 @@ private actor ListenerTransport: HTTPTransport {
         firstStatusResponse = nil
     }
 
+    func waitForFirstGrant() async {
+        if grantRequestCount > 0 { return }
+        await withCheckedContinuation { grantWaiters.append($0) }
+    }
+
+    func releaseFirstGrant() { grantResponse?.resume(); grantResponse = nil }
+
     func perform(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         let isReaction = request.url!.path.contains("reactions")
         let body: Data
         let code: Int
-        if isReaction {
+        if request.url!.lastPathComponent == "playback" {
+            grantRequestCount += 1
+            code = grantCodes.count > 1 ? grantCodes.removeFirst() : grantCodes[0]
+            let session = request.url!.pathComponents.dropLast().last!
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            let expires = formatter.string(from: Date().addingTimeInterval(grantLifetime))
+            body = code == 200 ? Data("{\"master_playlist_url\":\"https://example.test/live/\(session)/master.m3u8?playback_token=grant-\(grantRequestCount)\",\"expires_at\":\"\(expires)\",\"expires_in\":43200}".utf8) : Data(#"{"code":"subscription_required"}"#.utf8)
+            if holdFirstGrant && grantRequestCount == 1 {
+                await withCheckedContinuation { continuation in
+                    grantResponse = continuation
+                    grantWaiters.forEach { $0.resume() }; grantWaiters.removeAll()
+                }
+            } else {
+                grantWaiters.forEach { $0.resume() }; grantWaiters.removeAll()
+            }
+        } else if isReaction {
             reactionRequestCount += 1
             body = Data(#"{"reactions":[],"totals":{}}"#.utf8)
             code = 200
