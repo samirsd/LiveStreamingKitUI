@@ -1,5 +1,6 @@
 import XCTest
 import LiveStreamingKit
+import AVFoundation
 @testable import LiveStreamingKitUI
 
 @MainActor
@@ -196,6 +197,129 @@ final class LiveListenerLifecycleTests: XCTestCase {
         await coordinator.dismiss()
     }
 
+    func testVideoUsesOneNativePlayerWithoutStartingTheAudioBridge() async {
+        let transport = ListenerTransport(mediaType: "video")
+        let playback = ListenerPlaybackSpy()
+        let video = ListenerVideoPlaybackSpy()
+        let coordinator = LiveListenerCoordinator(client: makeClient(transport), playback: playback, videoPlayback: video)
+        await coordinator.present(sessionID: "portrait", source: nil)
+        XCTAssertEqual(coordinator.playbackState, .playing)
+        XCTAssertTrue(coordinator.engagement?.isVideoBroadcast == true)
+        XCTAssertEqual(coordinator.engagement?.videoAspectRatio, 9.0 / 16.0)
+        XCTAssertTrue(coordinator.videoPlayer === video.player)
+        XCTAssertEqual(video.playedURLs.count, 1)
+        XCTAssertNil(video.restorations.first ?? nil) // Initial playback requires a native play gesture.
+        XCTAssertTrue(playback.playedSessions.isEmpty)
+        await coordinator.dismiss()
+        XCTAssertNil(coordinator.videoPlayer)
+        XCTAssertEqual(video.stopCount, 1)
+    }
+
+    func testDeniedVideoGrantNeverCreatesMediaOrStartsAudio() async {
+        for denial in [401, 403] {
+            let transport = ListenerTransport(grantCodes: [denial], mediaType: "video")
+            let playback = ListenerPlaybackSpy()
+            let video = ListenerVideoPlaybackSpy()
+            let coordinator = LiveListenerCoordinator(client: makeClient(transport), playback: playback, videoPlayback: video)
+            await coordinator.present(sessionID: "denied", source: nil)
+            XCTAssertTrue(video.playedURLs.isEmpty)
+            XCTAssertTrue(playback.playedSessions.isEmpty)
+            XCTAssertNil(coordinator.videoPlayer)
+            XCTAssertEqual(coordinator.playbackState, .accessRequired(denial == 401 ? .authenticationRequired : .subscriptionRequired))
+            await coordinator.dismiss()
+        }
+    }
+
+    func testVideoRenewalRechecksGrantAndPreservesPausedReplayPosition() async {
+        let transport = ListenerTransport(statuses: ["ended"], mediaType: "video", mediaRefreshAfter: 0.2)
+        let playback = ListenerPlaybackSpy()
+        let video = ListenerVideoPlaybackSpy()
+        let renewed = expectation(description: "new media grant")
+        video.onPrepare = { if video.playedURLs.count == 2 { renewed.fulfill() } }
+        let coordinator = LiveListenerCoordinator(client: makeClient(transport), playback: playback, videoPlayback: video)
+        await coordinator.present(sessionID: "renew", source: nil)
+        video.currentSnapshot = .init(position: 37, playing: false)
+        await fulfillment(of: [renewed], timeout: 2)
+        XCTAssertEqual(video.restorations[1], .init(position: 37, playing: false))
+        XCTAssertEqual(video.playedURLs[1].query, "playback_token=grant-2")
+        XCTAssertTrue(playback.playedSessions.isEmpty)
+        await coordinator.dismiss()
+    }
+
+    func testRenewalDenialStopsVideoAndDoesNotFallBackToAudio() async {
+        let transport = ListenerTransport(grantCodes: [200, 403], mediaType: "video", mediaRefreshAfter: 0.1)
+        let playback = ListenerPlaybackSpy()
+        let video = ListenerVideoPlaybackSpy()
+        let coordinator = LiveListenerCoordinator(client: makeClient(transport), playback: playback, videoPlayback: video)
+        await coordinator.present(sessionID: "revoked", source: nil)
+        try? await Task.sleep(for: .milliseconds(250))
+        XCTAssertEqual(coordinator.playbackState, .accessRequired(.subscriptionRequired))
+        XCTAssertNil(coordinator.videoPlayer)
+        XCTAssertEqual(video.stopCount, 1)
+        XCTAssertTrue(playback.playedSessions.isEmpty)
+        await coordinator.dismiss()
+    }
+
+    func testVideoFailurePreservesPositionForExplicitRetryAndAccountChangeStopsIt() async {
+        let transport = ListenerTransport(mediaType: "video")
+        let playback = ListenerPlaybackSpy()
+        let video = ListenerVideoPlaybackSpy()
+        let coordinator = LiveListenerCoordinator(client: makeClient(transport), playback: playback, videoPlayback: video)
+        await coordinator.present(sessionID: "failure", source: nil)
+        video.currentSnapshot = .init(position: 19, playing: true)
+        video.onFailure?()
+        XCTAssertNil(coordinator.videoPlayer)
+        if case .failed = coordinator.playbackState {} else { XCTFail("Should offer reconnect") }
+        await coordinator.retry(ifPresenting: coordinator.engagement!)
+        XCTAssertEqual(video.restorations[1], .init(position: 19, playing: false))
+        coordinator.authenticationDidChange()
+        XCTAssertNil(coordinator.videoPlayer)
+        XCTAssertEqual(video.stopCount, 2)
+        XCTAssertTrue(playback.playedSessions.isEmpty)
+        await coordinator.dismiss()
+    }
+
+    func testVideoBackgroundPauseDoesNotAutomaticallyResume() async {
+        let video = ListenerVideoPlaybackSpy()
+        let coordinator = LiveListenerCoordinator(client: makeClient(ListenerTransport(mediaType: "video")), playback: ListenerPlaybackSpy(), videoPlayback: video)
+        await coordinator.present(sessionID: "background", source: nil)
+        video.currentSnapshot = .init(position: 7, playing: true)
+        coordinator.pauseVideoForBackground()
+        XCTAssertFalse(video.snapshot.playing)
+        XCTAssertEqual(video.playedURLs.count, 1)
+        await coordinator.dismiss()
+    }
+
+    func testClosingVideoWhileGrantIsInFlightCannotPrepareLateMedia() async {
+        let transport = ListenerTransport(holdFirstGrant: true, mediaType: "video")
+        let playback = ListenerPlaybackSpy()
+        let video = ListenerVideoPlaybackSpy()
+        let coordinator = LiveListenerCoordinator(client: makeClient(transport), playback: playback, videoPlayback: video)
+        let presenting = Task { await coordinator.present(sessionID: "closing-video", source: nil) }
+        await transport.waitForFirstGrant()
+        await coordinator.dismiss()
+        await transport.releaseFirstGrant()
+        await presenting.value
+        XCTAssertTrue(video.playedURLs.isEmpty)
+        XCTAssertTrue(playback.playedSessions.isEmpty)
+        XCTAssertNil(coordinator.videoPlayer)
+    }
+
+    func testVideoGrantExpiryStopsPlaybackAndRetryRestoresPositionWithoutAutoplay() async {
+        let transport = ListenerTransport(grantLifetime: 0.1, mediaType: "video")
+        let video = ListenerVideoPlaybackSpy()
+        let coordinator = LiveListenerCoordinator(client: makeClient(transport), playback: ListenerPlaybackSpy(), videoPlayback: video)
+        await coordinator.present(sessionID: "video-expiry", source: nil)
+        video.currentSnapshot = .init(position: 11, playing: true)
+        try? await Task.sleep(for: .milliseconds(200))
+        XCTAssertEqual(coordinator.playbackState, .expired)
+        XCTAssertNil(coordinator.videoPlayer)
+        XCTAssertEqual(video.stopCount, 1)
+        await coordinator.retry(ifPresenting: coordinator.engagement!)
+        XCTAssertEqual(video.restorations[1], .init(position: 11, playing: false))
+        await coordinator.dismiss()
+    }
+
     private func makeClient(_ transport: ListenerTransport) -> LiveStreamClient {
         LiveStreamClient(
             config: LiveStreamConfig(
@@ -205,6 +329,28 @@ final class LiveListenerLifecycleTests: XCTestCase {
             transport: transport
         )
     }
+}
+
+@MainActor
+private final class ListenerVideoPlaybackSpy: LiveListenerVideoPlayback {
+    let player = AVPlayer()
+    var playedURLs: [URL] = []
+    var restorations: [LiveListenerVideoSnapshot?] = []
+    var currentSnapshot = LiveListenerVideoSnapshot(position: 0, playing: false)
+    var snapshot: LiveListenerVideoSnapshot { currentSnapshot }
+    var onFailure: (@MainActor () -> Void)?
+    var onPrepare: (() -> Void)?
+    var stopCount = 0
+
+    func prepare(url: URL, restoring: LiveListenerVideoSnapshot?) {
+        playedURLs.append(url)
+        restorations.append(restoring)
+        currentSnapshot = restoring ?? .init(position: 0, playing: false)
+        onPrepare?()
+    }
+
+    func pause() { currentSnapshot.playing = false }
+    func stop() { stopCount += 1; currentSnapshot.playing = false }
 }
 
 @MainActor
@@ -229,6 +375,8 @@ private actor ListenerTransport: HTTPTransport {
     private let holdFirstGrant: Bool
     private var grantCodes: [Int]
     private let grantLifetime: TimeInterval
+    private let mediaType: String?
+    private let mediaRefreshAfter: TimeInterval?
     private var grantWaiters: [CheckedContinuation<Void, Never>] = []
     private var grantResponse: CheckedContinuation<Void, Never>?
     private(set) var grantRequestCount = 0
@@ -239,7 +387,9 @@ private actor ListenerTransport: HTTPTransport {
     private(set) var statusRequestCount = 0
     private(set) var reactionRequestCount = 0
 
-    init(holdFirstStatus: Bool = false, statuses: [String] = ["live"], statusCodes: [Int] = [200], holdFirstGrant: Bool = false, grantCodes: [Int] = [200], grantLifetime: TimeInterval = 43200) {
+    init(holdFirstStatus: Bool = false, statuses: [String] = ["live"], statusCodes: [Int] = [200], holdFirstGrant: Bool = false, grantCodes: [Int] = [200], grantLifetime: TimeInterval = 43200, mediaType: String? = nil, mediaRefreshAfter: TimeInterval? = nil) {
+        self.mediaType = mediaType
+        self.mediaRefreshAfter = mediaRefreshAfter
         self.holdFirstGrant = holdFirstGrant
         self.grantCodes = grantCodes
         self.grantLifetime = grantLifetime
@@ -276,7 +426,9 @@ private actor ListenerTransport: HTTPTransport {
             let formatter = ISO8601DateFormatter()
             formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
             let expires = formatter.string(from: Date().addingTimeInterval(grantLifetime))
-            body = code == 200 ? Data("{\"master_playlist_url\":\"https://example.test/live/\(session)/master.m3u8?playback_token=grant-\(grantRequestCount)\",\"expires_at\":\"\(expires)\",\"expires_in\":43200}".utf8) : Data(#"{"code":"subscription_required"}"#.utf8)
+            var grant: [String: Any] = ["master_playlist_url": "https://example.test/live/\(session)/master.m3u8?playback_token=grant-\(grantRequestCount)", "expires_at": expires, "expires_in": 43200]
+            grant["media_url_refresh_after_seconds"] = mediaRefreshAfter
+            body = code == 200 ? try JSONSerialization.data(withJSONObject: grant) : Data(#"{"code":"subscription_required"}"#.utf8)
             if holdFirstGrant && grantRequestCount == 1 {
                 await withCheckedContinuation { continuation in
                     grantResponse = continuation
@@ -293,7 +445,10 @@ private actor ListenerTransport: HTTPTransport {
             statusRequestCount += 1
             let status = statuses.count > 1 ? statuses.removeFirst() : statuses[0]
             code = statusCodes.count > 1 ? statusCodes.removeFirst() : statusCodes[0]
-            body = Data("{\"status\":\"\(status)\",\"listener_count\":2}".utf8)
+            var metadata: [String: Any] = ["status": status, "listener_count": 2]
+            metadata["media_type"] = mediaType
+            if mediaType == "video" { metadata["video_width"] = 720; metadata["video_height"] = 1280 }
+            body = try JSONSerialization.data(withJSONObject: metadata)
             if holdFirstStatus && statusRequestCount == 1 {
                 await withCheckedContinuation { continuation in
                     firstStatusResponse = continuation
