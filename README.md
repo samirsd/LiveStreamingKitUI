@@ -46,6 +46,32 @@ always requests a fresh grant. On grant expiry, audio stops and the sheet offers
 reconnection rather than failing silently. Closing/replacing the presentation
 invalidates outstanding grant requests.
 
+### Video listeners
+
+Session metadata with `media_type: "video"` selects a single native `AVPlayer`
+inside the listener sheet. Its HLS rendition owns both picture and sound; the
+host's audio-only playback bridge is not started. Missing media metadata keeps
+the existing audio behavior. Video dimensions determine aspect-fit framing,
+including 9:16 portrait broadcasts, and native controls provide play, seek and
+fullscreen playback.
+
+Initial video presentation prepares the player and requires a play gesture.
+Backgrounding pauses video and does not automatically resume it. Dismissal,
+account replacement, grant expiry and failures remove the current player item.
+Failures expose fixed recovery copy rather than raw errors containing signed
+media URLs.
+
+Video grants may include `media_url_refresh_after_seconds`. The coordinator
+reauthorizes and reloads the rendition before private object links expire,
+preserving current position and paused/playing intent. A renewal rejection
+stops playback and shows the existing access/retry state. This also supports
+ended replays whose HLS playlist otherwise would not refresh automatically.
+
+`LiveListenerVideoPlayback` can be injected for lifecycle tests or a host video
+player. The default `AVPlayerLiveListenerVideoPlayback` retains one player and
+replaces its item after authorization. Physical device capture and long-running
+venue/network tests remain part of application release validation.
+
 ## Installation
 
 ```swift

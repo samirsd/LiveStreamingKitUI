@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import LiveStreamingKit
+@preconcurrency import AVFoundation
 
 public enum LiveListenerPlaybackState: Equatable, Sendable {
     case idle
@@ -16,27 +17,34 @@ public enum LiveListenerPlaybackState: Equatable, Sendable {
 public final class LiveListenerCoordinator: ObservableObject {
     @Published public private(set) var engagement: LiveStreamEngagementController?
     @Published public private(set) var playbackState: LiveListenerPlaybackState = .idle
+    @Published public private(set) var videoPlayer: AVPlayer?
 
     private let client: LiveStreamClient
     private let playback: any LiveListenerPlaybackBridge
+    private let videoPlayback: any LiveListenerVideoPlayback
     private let grantProvider: @MainActor (String) async throws -> LiveListenerPlaybackGrant
     private let accessAction: (@MainActor (String, LiveListenerAccessError) -> Void)?
     private var generation: UInt64 = 0
     private var statusSubscription: AnyCancellable?
     private var authorizationTask: Task<Void, Never>?
     private var expiryTask: Task<Void, Never>?
+    private var mediaRefreshTask: Task<Void, Never>?
+    private var pendingVideoContinuation: LiveListenerVideoSnapshot?
     private var playbackStarted = false
 
     public init(
         client: LiveStreamClient,
         playback: any LiveListenerPlaybackBridge,
+        videoPlayback: (any LiveListenerVideoPlayback)? = nil,
         grantProvider: (@MainActor (String) async throws -> LiveListenerPlaybackGrant)? = nil,
         onAccessRequired: (@MainActor (String, LiveListenerAccessError) -> Void)? = nil
     ) {
         self.client = client
         self.playback = playback
+        self.videoPlayback = videoPlayback ?? AVPlayerLiveListenerVideoPlayback()
         self.grantProvider = grantProvider ?? { try await client.fetchPlaybackGrant(sessionID: $0) }
         accessAction = onAccessRequired
+        self.videoPlayback.onFailure = { [weak self] in self?.playbackDidFail() }
     }
 
     public func present(sessionID: String, source: String?) async {
@@ -77,6 +85,7 @@ public final class LiveListenerCoordinator: ObservableObject {
         guard engagement === controller, !controller.isLoading, playbackState != .authorizing else { return }
         generation &+= 1
         let requestGeneration = generation
+        if videoPlayer != nil { pendingVideoContinuation = videoPlayback.snapshot }
         stopPlayback()
         playbackState = .idle
         await controller.stop()
@@ -97,6 +106,7 @@ public final class LiveListenerCoordinator: ObservableObject {
     public func authenticationDidChange() {
         guard engagement != nil else { return }
         generation &+= 1
+        pendingVideoContinuation = nil
         stopPlayback()
         playbackState = .failed("Your account changed. Reconnect to check access for this account.")
     }
@@ -106,6 +116,9 @@ public final class LiveListenerCoordinator: ObservableObject {
     public func playbackDidFail() {
         guard engagement != nil, playbackStarted else { return }
         generation &+= 1
+        if videoPlayer != nil {
+            pendingVideoContinuation = LiveListenerVideoSnapshot(position: videoPlayback.snapshot.position, playing: false)
+        }
         stopPlayback()
         playbackState = .failed("Playback interrupted. Reconnect to check your access.")
     }
@@ -121,6 +134,7 @@ public final class LiveListenerCoordinator: ObservableObject {
         let previous = engagement
         statusSubscription = nil
         engagement = nil
+        pendingVideoContinuation = nil
         stopPlayback()
         playbackState = .idle
         return previous
@@ -131,8 +145,23 @@ public final class LiveListenerCoordinator: ObservableObject {
         authorizationTask = nil
         expiryTask?.cancel()
         expiryTask = nil
-        if playbackStarted { playback.stopLiveStream() }
+        mediaRefreshTask?.cancel()
+        mediaRefreshTask = nil
+        if videoPlayer != nil {
+            videoPlayback.stop()
+            videoPlayer = nil
+        } else if playbackStarted { playback.stopLiveStream() }
         playbackStarted = false
+    }
+
+    /// Match the web listener: backgrounding pauses video without silently
+    /// resuming audible playback when the scene becomes active again.
+    public func pauseVideoForBackground() {
+        videoPlayback.pause()
+        if var pendingVideoContinuation {
+            pendingVideoContinuation.playing = false
+            self.pendingVideoContinuation = pendingVideoContinuation
+        }
     }
 
     private func updatePlayback(status: String, controller: LiveStreamEngagementController) {
@@ -148,9 +177,9 @@ public final class LiveListenerCoordinator: ObservableObject {
         }
     }
 
-    private func beginPlaybackAuthorization(controller: LiveStreamEngagementController) {
+    private func beginPlaybackAuthorization(controller: LiveStreamEngagementController, refreshingVideo: Bool = false) {
         let requestGeneration = generation
-        playbackState = .authorizing
+        if !refreshingVideo { playbackState = .authorizing }
         authorizationTask = Task { @MainActor [weak self, weak controller] in
             guard let self, let controller else { return }
             do {
@@ -158,15 +187,26 @@ public final class LiveListenerCoordinator: ObservableObject {
                 guard self.generation == requestGeneration, self.engagement === controller,
                       !Task.isCancelled else { return }
                 guard grant.expiresAt > Date() else { throw LiveListenerAccessError.invalidResponse }
-                self.playback.playLiveStream(
-                    url: grant.masterPlaylistURL, title: "live broadcast", sessionID: controller.sessionID
-                )
+                if controller.isVideoBroadcast {
+                    let continuation = refreshingVideo ? self.videoPlayback.snapshot : self.pendingVideoContinuation
+                    self.pendingVideoContinuation = nil
+                    self.videoPlayback.prepare(url: grant.masterPlaylistURL, restoring: continuation)
+                    self.videoPlayer = self.videoPlayback.player
+                } else {
+                    self.playback.playLiveStream(
+                        url: grant.masterPlaylistURL, title: "live broadcast", sessionID: controller.sessionID
+                    )
+                }
                 self.playbackStarted = true
                 self.playbackState = .playing
                 self.scheduleExpiry(grant.expiresAt, generation: requestGeneration, controller: controller)
+                if controller.isVideoBroadcast, let refreshAfter = grant.mediaURLRefreshAfterSeconds {
+                    self.scheduleMediaRefresh(after: refreshAfter, generation: requestGeneration, controller: controller)
+                }
             } catch {
                 guard self.generation == requestGeneration, self.engagement === controller,
                       !Task.isCancelled else { return }
+                self.stopPlayback()
                 if let accessError = error as? LiveListenerAccessError,
                    accessError == .authenticationRequired || accessError == .subscriptionRequired {
                     self.playbackState = .accessRequired(accessError)
@@ -184,8 +224,22 @@ public final class LiveListenerCoordinator: ObservableObject {
             do { try await Task.sleep(for: .seconds(max(0, date.timeIntervalSinceNow))) } catch { return }
             guard let self, let controller, self.generation == generation,
                   self.engagement === controller else { return }
+            if self.videoPlayer != nil {
+                self.pendingVideoContinuation = LiveListenerVideoSnapshot(position: self.videoPlayback.snapshot.position, playing: false)
+            }
             self.stopPlayback()
             self.playbackState = .expired
+        }
+    }
+
+    private func scheduleMediaRefresh(after seconds: TimeInterval, generation: UInt64, controller: LiveStreamEngagementController) {
+        guard seconds.isFinite, seconds > 0 else { return }
+        mediaRefreshTask?.cancel()
+        mediaRefreshTask = Task { @MainActor [weak self, weak controller] in
+            do { try await Task.sleep(for: .seconds(seconds)) } catch { return }
+            guard let self, let controller, self.generation == generation,
+                  self.engagement === controller, self.videoPlayer != nil else { return }
+            self.beginPlaybackAuthorization(controller: controller, refreshingVideo: true)
         }
     }
 }

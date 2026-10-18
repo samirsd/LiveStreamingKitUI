@@ -25,6 +25,8 @@ public final class LiveStreamEngagementController: ObservableObject {
     @Published public private(set) var hasLoadedInitialState: Bool = false
     @Published public private(set) var isLoading: Bool = false
     @Published public private(set) var lastErrorMessage: String?
+    @Published public private(set) var isVideoBroadcast = false
+    @Published public private(set) var videoAspectRatio: Double = 9.0 / 16.0
 
     /// Float duration matches the broadcaster's `LiveStreamControlViewModel`
     /// and the web listener page — same reaction surfaces for the same
@@ -65,6 +67,8 @@ public final class LiveStreamEngagementController: ObservableObject {
         lastErrorMessage = nil
         hasLoadedInitialState = false
         sessionStatus = "pending"
+        isVideoBroadcast = false
+        videoAspectRatio = 9.0 / 16.0
 
         let placeholder = LiveStreamSession(
             id: sessionID,
@@ -90,6 +94,10 @@ public final class LiveStreamEngagementController: ObservableObject {
         totalListeners = status.total_listeners ?? 0
         peakListenerCount = status.peak_listener_count ?? 0
         reactionTotals = status.reaction_totals ?? [:]
+        isVideoBroadcast = status.media_type == "video"
+        if let width = status.video_width, let height = status.video_height, width > 0, height > 0 {
+            videoAspectRatio = Double(width) / Double(height)
+        }
         hasLoadedInitialState = true
         sessionStatus = status.status
 

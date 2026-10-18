@@ -1,4 +1,5 @@
 import SwiftUI
+import AVKit
 
 public extension View {
     /// Present the listener at the scene root. Closing the sheet also stops
@@ -35,6 +36,7 @@ private struct LiveListenerSheetModifier: ViewModifier {
 
 @MainActor
 private struct LiveListenerSheetContent: View {
+    @Environment(\.scenePhase) private var scenePhase
     @ObservedObject var controller: LiveStreamEngagementController
     @ObservedObject var coordinator: LiveListenerCoordinator
 
@@ -73,11 +75,11 @@ private struct LiveListenerSheetContent: View {
                     retryButton(title: "check access again")
                 } else if case .failed(let message) = coordinator.playbackState {
                     Text(message).foregroundStyle(.secondary)
-                    retryButton(title: "reconnect audio")
+                    retryButton(title: reconnectTitle)
                 } else if coordinator.playbackState == .expired {
                     Text("Reconnect to renew your listening access and keep listening.")
                         .foregroundStyle(.secondary)
-                    retryButton(title: "reconnect audio")
+                    retryButton(title: reconnectTitle)
                 } else if controller.isLoading {
                     ProgressView("connecting to broadcast…")
                 } else if let error = controller.lastErrorMessage {
@@ -90,19 +92,30 @@ private struct LiveListenerSheetContent: View {
                     retryButton(title: "try again")
                 } else {
                     if !controller.isLive && !controller.isEnded {
-                        Text("audio will start when the broadcaster goes live.")
+                        Text(controller.isVideoBroadcast ? "video will be ready when the broadcaster goes live." : "audio will start when the broadcaster goes live.")
                             .foregroundStyle(.secondary)
+                    }
+                    if let player = coordinator.videoPlayer {
+                        VideoPlayer(player: player)
+                            .aspectRatio(controller.videoAspectRatio, contentMode: .fit)
+                            .frame(maxHeight: 540)
+                            .frame(maxWidth: .infinity)
+                            .accessibilityLabel(controller.isLive ? "live video broadcast" : "video broadcast replay")
+                            .accessibilityIdentifier("livestream.listener.video")
                     }
                     LiveEngagementOverlay(controller: controller, layout: .expanded)
                     if controller.isLive || controller.isEnded {
-                        retryButton(title: "reconnect audio")
+                        retryButton(title: reconnectTitle)
                     }
                 }
             }
             .padding(20)
         }
-        .presentationDetents([.medium, .large])
+        .presentationDetents(controller.isVideoBroadcast ? [.large] : [.medium, .large])
         .presentationDragIndicator(.visible)
+        .onChange(of: scenePhase) { _, phase in
+            if phase != .active { coordinator.pauseVideoForBackground() }
+        }
     }
 
     private var title: String {
@@ -131,4 +144,6 @@ private struct LiveListenerSheetContent: View {
         .buttonStyle(.bordered)
         .disabled(controller.isLoading || coordinator.playbackState == .authorizing)
     }
+
+    private var reconnectTitle: String { controller.isVideoBroadcast ? "reconnect video" : "reconnect audio" }
 }
