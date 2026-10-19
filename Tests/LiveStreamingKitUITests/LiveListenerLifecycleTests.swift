@@ -5,6 +5,103 @@ import AVFoundation
 
 @MainActor
 final class LiveListenerLifecycleTests: XCTestCase {
+    func testDefaultVideoPresentationStillUsesExistingListenerSheet() async {
+        let coordinator = LiveListenerCoordinator(client: makeClient(ListenerTransport(mediaType: "video")),
+            playback: ListenerPlaybackSpy(), videoPlayback: ListenerVideoPlaybackSpy())
+        await coordinator.present(sessionID: "default-video", source: nil)
+        XCTAssertEqual(coordinator.mediaKind, .video)
+        XCTAssertTrue(coordinator.shouldPresentListenerSheet)
+        XCTAssertFalse(coordinator.usesHostVideoPresentation)
+        await coordinator.dismiss()
+    }
+
+    func testOptInVideoUsesHostWhileNormalAudioKeepsExistingSheetAndBridge() async {
+        let video = ListenerVideoPlaybackSpy(), audio = ListenerPlaybackSpy()
+        let coordinator = LiveListenerCoordinator(client: makeClient(ListenerTransport(mediaType: "video")),
+            playback: audio, videoPlayback: video, videoPresentationMode: .hostPopup)
+        await coordinator.present(sessionID: "host-video", source: nil)
+        XCTAssertTrue(coordinator.usesHostVideoPresentation)
+        XCTAssertFalse(coordinator.shouldPresentListenerSheet)
+        XCTAssertTrue(coordinator.videoPlayer === video.player)
+        XCTAssertTrue(audio.playedSessions.isEmpty)
+        await coordinator.dismiss()
+
+        let audioCoordinator = LiveListenerCoordinator(client: makeClient(ListenerTransport()),
+            playback: audio, videoPresentationMode: .hostPopup)
+        await audioCoordinator.present(sessionID: "audio", source: nil)
+        XCTAssertEqual(audioCoordinator.mediaKind, .audio)
+        XCTAssertTrue(audioCoordinator.shouldPresentListenerSheet)
+        XCTAssertFalse(audioCoordinator.usesHostVideoPresentation)
+        XCTAssertEqual(audio.playedSessions, ["audio"])
+        await audioCoordinator.dismiss()
+    }
+
+    func testHostDefersUnknownMediaWithoutFlashingAnAudioSheet() async {
+        let transport = ListenerTransport(holdFirstStatus: true, mediaType: "video")
+        let coordinator = LiveListenerCoordinator(client: makeClient(transport), playback: ListenerPlaybackSpy(),
+            videoPlayback: ListenerVideoPlaybackSpy(), videoPresentationMode: .hostPopup)
+        let present = Task { await coordinator.present(sessionID: "unknown", source: nil) }
+        await transport.waitForFirstStatus()
+        XCTAssertEqual(coordinator.mediaKind, .unresolved)
+        XCTAssertFalse(coordinator.shouldPresentListenerSheet)
+        XCTAssertFalse(coordinator.usesHostVideoPresentation)
+        await transport.releaseFirstStatus(); await present.value
+        XCTAssertTrue(coordinator.usesHostVideoPresentation)
+        XCTAssertFalse(coordinator.shouldPresentListenerSheet)
+        await coordinator.dismiss()
+    }
+
+    func testHostInitialMetadataFailureKeepsExistingErrorAndRetrySheet() async {
+        let coordinator = LiveListenerCoordinator(client: makeClient(ListenerTransport(statusCodes: [503])),
+            playback: ListenerPlaybackSpy(), videoPresentationMode: .hostPopup)
+        await coordinator.present(sessionID: "metadata-failed", source: nil)
+        XCTAssertEqual(coordinator.mediaKind, .unresolved)
+        XCTAssertTrue(coordinator.shouldPresentListenerSheet)
+        XCTAssertNotNil(coordinator.engagement?.lastErrorMessage)
+        await coordinator.dismiss()
+    }
+
+    func testHostRetryRetainsVideoClassificationWhenMetadataReloadFails() async {
+        let coordinator = LiveListenerCoordinator(client: makeClient(ListenerTransport(statusCodes: [200, 503], mediaType: "video")),
+            playback: ListenerPlaybackSpy(), videoPlayback: ListenerVideoPlaybackSpy(), videoPresentationMode: .hostPopup)
+        await coordinator.present(sessionID: "retry-host-video", source: nil)
+        let controller = coordinator.engagement!
+        await coordinator.retry(ifPresenting: controller)
+        XCTAssertNotNil(controller.lastErrorMessage)
+        XCTAssertEqual(coordinator.mediaKind, .video)
+        XCTAssertTrue(coordinator.usesHostVideoPresentation)
+        XCTAssertFalse(coordinator.shouldPresentListenerSheet)
+        await coordinator.dismiss()
+    }
+
+    func testHostCloseStopsPlayerSynchronouslyBeforeAwaitingSocialShutdown() async {
+        let video = ListenerVideoPlaybackSpy()
+        let coordinator = LiveListenerCoordinator(client: makeClient(ListenerTransport(mediaType: "video")),
+            playback: ListenerPlaybackSpy(), videoPlayback: video, videoPresentationMode: .hostPopup)
+        await coordinator.present(sessionID: "close-host-video", source: nil)
+        let controller = coordinator.engagement!
+        let close = coordinator.beginDismiss(ifPresenting: controller)
+        XCTAssertNil(coordinator.engagement)
+        XCTAssertNil(coordinator.videoPlayer)
+        XCTAssertEqual(coordinator.playbackState, .idle)
+        XCTAssertEqual(video.stopCount, 1)
+        XCTAssertFalse(coordinator.shouldPresentListenerSheet)
+        await close?.value
+    }
+
+    func testStaleHostCloseCannotDetachANewerListener() async {
+        let coordinator = LiveListenerCoordinator(client: makeClient(ListenerTransport(mediaType: "video")),
+            playback: ListenerPlaybackSpy(), videoPlayback: ListenerVideoPlaybackSpy(), videoPresentationMode: .hostPopup)
+        await coordinator.present(sessionID: "first-host", source: nil)
+        let first = coordinator.engagement!
+        await coordinator.present(sessionID: "second-host", source: nil)
+        let current = coordinator.engagement
+        XCTAssertNil(coordinator.beginDismiss(ifPresenting: first))
+        XCTAssertTrue(coordinator.engagement === current)
+        XCTAssertTrue(coordinator.usesHostVideoPresentation)
+        await coordinator.dismiss()
+    }
+
     func testDismissDuringInitialRequestDoesNotStartPlaybackOrPolling() async {
         let transport = ListenerTransport(holdFirstStatus: true)
         let playback = ListenerPlaybackSpy()

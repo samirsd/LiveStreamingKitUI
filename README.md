@@ -72,6 +72,31 @@ player. The default `AVPlayerLiveListenerVideoPlayback` retains one player and
 replaces its item after authorization. Physical device capture and long-running
 venue/network tests remain part of application release validation.
 
+### Host popup presentation
+
+The default listener still uses `liveListenerSheet`. A host with an existing
+video popup can opt into `LiveListenerCoordinator(videoPresentationMode:
+.hostPopup)`. Observe `usesHostVideoPresentation` and borrow `videoPlayer`;
+the coordinator remains the sole owner of playback authorization, renewal,
+position restoration and player-item replacement. Do not construct another
+player or request a second grant. Metadata resolves before video suppresses
+the normal sheet; audio and initial metadata failures retain that sheet.
+
+Embed `LiveListenerContent(controller:coordinator:showsVideo:false,
+showsHeader:false)` below the borrowed player to retain reactions, listening
+options and reconnect controls. The content uses FontKit typography and
+semantic colors. Forward account changes and background pauses as usual.
+When switching to other media, call `beginDismiss(ifPresenting:)` to detach
+authorized playback synchronously before awaiting social-poller shutdown.
+Fence popup updates by the exact controller/request identity so late renewals
+cannot dismiss a newer selection. Live status changes should update existing
+chrome without expanding a docked player, and live HLS has no finite progress.
+
+This presentation API accepts an already known session ID. It does not add
+recording-to-video discovery: a cloud-only recording on another device still
+needs authorized server metadata linking the recording to its video session.
+The local archive catalog is not a substitute for that server contract.
+
 ## Installation
 
 ```swift

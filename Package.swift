@@ -14,6 +14,9 @@ let hasLocalLiveStreamingKit = isLocalPackagesWorkspace && ["LiveStreamingKit", 
 let useLocalDependencies =
     ProcessInfo.processInfo.environment["USE_LOCAL_PACKAGES"] == "1" ||
     hasLocalLiveStreamingKit
+let hasLocalFontKit = isLocalPackagesWorkspace && FileManager.default.fileExists(
+    atPath: packageDirectory.appendingPathComponent("../FontKit/Package.swift").standardizedFileURL.path
+)
 
 let package = Package(
     name: "LiveStreamingKitUI",
@@ -34,11 +37,14 @@ let package = Package(
         useLocalDependencies ?
             .package(path: "../LoggingKit") :
             .package(url: "https://github.com/samirsd/LoggingKit.git", from: "1.0.11"),
+        hasLocalFontKit ?
+            .package(path: "../FontKit") :
+            .package(url: "https://github.com/samirsd/FontKit.git", from: "1.0.11"),
     ],
     targets: [
         .target(
             name: "LiveStreamingKitUI",
-            dependencies: ["LiveStreamingKit", "LoggingKit"]
+            dependencies: ["LiveStreamingKit", "LoggingKit", "FontKit"]
         ),
         .testTarget(
             name: "LiveStreamingKitUITests",

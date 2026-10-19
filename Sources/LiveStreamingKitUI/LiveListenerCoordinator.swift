@@ -12,12 +12,35 @@ public enum LiveListenerPlaybackState: Equatable, Sendable {
     case expired
 }
 
+/// Opt-in rendering policy. Playback and authorization remain coordinator-owned.
+public enum LiveListenerVideoPresentationMode: Equatable, Sendable {
+    case sheet
+    case hostPopup
+}
+
+public enum LiveListenerMediaKind: Equatable, Sendable {
+    case unresolved, audio, video
+}
+
 /// Owns one listener presentation, its Pro authorization, and playback.
 @MainActor
 public final class LiveListenerCoordinator: ObservableObject {
     @Published public private(set) var engagement: LiveStreamEngagementController?
     @Published public private(set) var playbackState: LiveListenerPlaybackState = .idle
     @Published public private(set) var videoPlayer: AVPlayer?
+    @Published public private(set) var mediaKind: LiveListenerMediaKind = .unresolved
+
+    public let videoPresentationMode: LiveListenerVideoPresentationMode
+    public var usesHostVideoPresentation: Bool {
+        videoPresentationMode == .hostPopup && mediaKind == .video
+    }
+    public var shouldPresentListenerSheet: Bool {
+        guard let engagement else { return false }
+        guard videoPresentationMode == .hostPopup else { return true }
+        // Defer initial presentation until metadata classifies the media. A
+        // failed metadata request retains the existing retry/error sheet.
+        return mediaKind == .audio || (mediaKind == .unresolved && engagement.lastErrorMessage != nil)
+    }
 
     private let client: LiveStreamClient
     private let playback: any LiveListenerPlaybackBridge
@@ -26,6 +49,7 @@ public final class LiveListenerCoordinator: ObservableObject {
     private let accessAction: (@MainActor (String, LiveListenerAccessError) -> Void)?
     private var generation: UInt64 = 0
     private var statusSubscription: AnyCancellable?
+    private var engagementObservation: AnyCancellable?
     private var authorizationTask: Task<Void, Never>?
     private var expiryTask: Task<Void, Never>?
     private var mediaRefreshTask: Task<Void, Never>?
@@ -37,11 +61,13 @@ public final class LiveListenerCoordinator: ObservableObject {
         playback: any LiveListenerPlaybackBridge,
         videoPlayback: (any LiveListenerVideoPlayback)? = nil,
         grantProvider: (@MainActor (String) async throws -> LiveListenerPlaybackGrant)? = nil,
-        onAccessRequired: (@MainActor (String, LiveListenerAccessError) -> Void)? = nil
+        onAccessRequired: (@MainActor (String, LiveListenerAccessError) -> Void)? = nil,
+        videoPresentationMode: LiveListenerVideoPresentationMode = .sheet
     ) {
         self.client = client
         self.playback = playback
         self.videoPlayback = videoPlayback ?? AVPlayerLiveListenerVideoPlayback()
+        self.videoPresentationMode = videoPresentationMode
         self.grantProvider = grantProvider ?? { try await client.fetchPlaybackGrant(sessionID: $0) }
         accessAction = onAccessRequired
         self.videoPlayback.onFailure = { [weak self] in self?.playbackDidFail() }
@@ -62,8 +88,18 @@ public final class LiveListenerCoordinator: ObservableObject {
 
         let controller = LiveStreamEngagementController(sessionID: sessionID, client: client, source: source)
         engagement = controller
+        engagementObservation = controller.objectWillChange.sink { [weak self, weak controller] in
+            // Child @Published values emit before mutation. Forward a coherent
+            // snapshot on the next actor turn, fenced to this presentation.
+            Task { @MainActor in
+                guard let self, let controller, self.engagement === controller else { return }
+                self.updatePresentationMetadata(controller)
+                self.objectWillChange.send()
+            }
+        }
         statusSubscription = controller.$sessionStatus.sink { [weak self, weak controller] status in
             guard let self, let controller, self.engagement === controller else { return }
+            self.updatePresentationMetadata(controller)
             self.updatePlayback(status: status, controller: controller)
         }
         await controller.start()
@@ -79,6 +115,16 @@ public final class LiveListenerCoordinator: ObservableObject {
     public func dismiss(ifPresenting controller: LiveStreamEngagementController) async {
         guard engagement === controller else { return }
         await dismiss()
+    }
+
+    /// Host popup cancellation must stop media synchronously before another
+    /// player starts. Only the detached social poller's shutdown is awaited.
+    @discardableResult
+    public func beginDismiss(ifPresenting controller: LiveStreamEngagementController) -> Task<Void, Never>? {
+        guard engagement === controller else { return nil }
+        generation &+= 1
+        let previous = detachCurrentEngagement()
+        return Task { if let previous { await previous.stop() } }
     }
 
     public func retry(ifPresenting controller: LiveStreamEngagementController) async {
@@ -133,11 +179,19 @@ public final class LiveListenerCoordinator: ObservableObject {
     private func detachCurrentEngagement() -> LiveStreamEngagementController? {
         let previous = engagement
         statusSubscription = nil
+        engagementObservation = nil
         engagement = nil
+        mediaKind = .unresolved
         pendingVideoContinuation = nil
         stopPlayback()
         playbackState = .idle
         return previous
+    }
+
+    private func updatePresentationMetadata(_ controller: LiveStreamEngagementController) {
+        guard engagement === controller, controller.hasLoadedInitialState else { return }
+        let next: LiveListenerMediaKind = controller.isVideoBroadcast ? .video : .audio
+        if mediaKind != next { mediaKind = next }
     }
 
     private func stopPlayback() {
