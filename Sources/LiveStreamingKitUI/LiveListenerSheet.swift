@@ -1,5 +1,6 @@
 import SwiftUI
 import AVKit
+import FontKit
 
 public extension View {
     /// Present the listener at the scene root. Closing the sheet also stops
@@ -21,31 +22,45 @@ private struct LiveListenerSheetModifier: ViewModifier {
     func body(content: Content) -> some View {
         let presentedController = coordinator.engagement
         content.sheet(
-            item: Binding(
-                get: { coordinator.engagement.map { LiveListenerPresentation(controller: $0) } },
+            item: Binding<LiveListenerPresentation?>(
+                get: {
+                    guard coordinator.shouldPresentListenerSheet else { return nil }
+                    return coordinator.engagement.map { LiveListenerPresentation(controller: $0) }
+                },
                 set: { newValue in
-                    guard newValue == nil, let presentedController else { return }
+                    guard newValue == nil, let presentedController,
+                          coordinator.shouldPresentListenerSheet else { return }
                     Task { await coordinator.dismiss(ifPresenting: presentedController) }
                 }
             )
         ) { presentation in
-            LiveListenerSheetContent(controller: presentation.controller, coordinator: coordinator)
+            LiveListenerContent(controller: presentation.controller, coordinator: coordinator)
         }
     }
 }
 
 @MainActor
-private struct LiveListenerSheetContent: View {
+public struct LiveListenerContent: View {
     @Environment(\.scenePhase) private var scenePhase
     @ObservedObject var controller: LiveStreamEngagementController
     @ObservedObject var coordinator: LiveListenerCoordinator
+    private let showsVideo: Bool
+    private let showsHeader: Bool
 
-    var body: some View {
+    public init(controller: LiveStreamEngagementController, coordinator: LiveListenerCoordinator,
+                showsVideo: Bool = true, showsHeader: Bool = true) {
+        self.controller = controller
+        self.coordinator = coordinator
+        self.showsVideo = showsVideo
+        self.showsHeader = showsHeader
+    }
+
+    public var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                HStack {
+                if showsHeader { HStack {
                     Text(title)
-                        .font(.headline)
+                        .customFontStyle(.title)
                         .accessibilityAddTraits(.isHeader)
                     Spacer()
                     Button {
@@ -53,10 +68,10 @@ private struct LiveListenerSheetContent: View {
                     } label: {
                         Image(systemName: "xmark.circle.fill")
                             .font(.title2)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(FontKit.colors.textSecondary)
                     }
                     .accessibilityLabel("close and stop listening")
-                }
+                } }
 
                 if coordinator.playbackState == .authorizing {
                     ProgressView("checking listening access…")
@@ -64,7 +79,7 @@ private struct LiveListenerSheetContent: View {
                     Text(requirement == .authenticationRequired
                          ? "Sign in to check your Carnyx Pro access to this broadcast."
                          : "Listen to this broadcast with Carnyx Pro. See available subscription and trial options.")
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(FontKit.colors.textSecondary)
                     if coordinator.canRequestAccess {
                         Button(requirement == .authenticationRequired ? "Sign in to listen" : "See listening options") {
                             coordinator.requestAccess(ifPresenting: controller)
@@ -74,28 +89,28 @@ private struct LiveListenerSheetContent: View {
                     }
                     retryButton(title: "check access again")
                 } else if case .failed(let message) = coordinator.playbackState {
-                    Text(message).foregroundStyle(.secondary)
+                    Text(message).foregroundStyle(FontKit.colors.textSecondary)
                     retryButton(title: reconnectTitle)
                 } else if coordinator.playbackState == .expired {
                     Text("Reconnect to renew your listening access and keep listening.")
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(FontKit.colors.textSecondary)
                     retryButton(title: reconnectTitle)
                 } else if controller.isLoading {
                     ProgressView("connecting to broadcast…")
                 } else if let error = controller.lastErrorMessage {
                     Text(error)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(FontKit.colors.textSecondary)
                     retryButton(title: "try again")
                 } else if controller.sessionStatus == "failed" {
                     Text("this broadcast is no longer available.")
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(FontKit.colors.textSecondary)
                     retryButton(title: "try again")
                 } else {
                     if !controller.isLive && !controller.isEnded {
                         Text(controller.isVideoBroadcast ? "video will be ready when the broadcaster goes live." : "audio will start when the broadcaster goes live.")
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(FontKit.colors.textSecondary)
                     }
-                    if let player = coordinator.videoPlayer {
+                    if showsVideo, let player = coordinator.videoPlayer {
                         VideoPlayer(player: player)
                             .aspectRatio(controller.videoAspectRatio, contentMode: .fit)
                             .frame(maxHeight: 540)
@@ -109,8 +124,12 @@ private struct LiveListenerSheetContent: View {
                     }
                 }
             }
+            .customFontStyle(.body)
+            .foregroundStyle(FontKit.colors.textPrimary)
+            .tint(FontKit.colors.accent)
             .padding(20)
         }
+        .background(FontKit.colors.backgroundPrimary)
         .presentationDetents(controller.isVideoBroadcast ? [.large] : [.medium, .large])
         .presentationDragIndicator(.visible)
         .onChange(of: scenePhase) { _, phase in
